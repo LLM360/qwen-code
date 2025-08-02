@@ -19,6 +19,8 @@ import {
   FunctionCall,
   GenerateContentResponse,
 } from '@google/genai';
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
 
 import { parseAndFormatApiError } from './ui/utils/errorParsing.js';
 
@@ -256,6 +258,14 @@ export async function runNonInteractive(
         currentMessages = [{ role: 'user', parts: toolResponseParts }];
       } else {
         process.stdout.write('\n'); // Ensure a final newline
+        
+        // Auto-save conversation to history.json
+        const history = chat.getHistory();
+        if (history.length > 0) {
+          const filepath = path.join(process.cwd(), 'history.json');
+          await fs.writeFile(filepath, JSON.stringify(history, null, 2), 'utf-8');
+        }
+        
         return;
       }
     }
