@@ -158,9 +158,11 @@ export async function runNonInteractive(
         
         // Auto-save conversation to history.json
         const history = chat.getHistory();
-        if (history.length > 0) {
-          const filepath = path.join(process.cwd(), 'history.json');
-          await fs.writeFile(filepath, JSON.stringify(history, null, 2), 'utf-8');
+        const historyPath = path.join(process.cwd(), 'history.json');
+        try {
+          await fs.writeFile(historyPath, JSON.stringify(history, null, 2), 'utf-8');
+        } catch (error) {
+          console.error('Error saving conversation history:', error);
         }
         
         return;
