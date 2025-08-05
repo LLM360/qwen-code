@@ -155,16 +155,20 @@ export async function runNonInteractive(
         currentMessages = [{ role: 'user', parts: toolResponseParts }];
       } else {
         process.stdout.write('\n'); // Ensure a final newline
-        
+
         // Auto-save conversation to history.json
         const history = chat.getHistory();
         const historyPath = path.join(process.cwd(), 'history.json');
         try {
-          await fs.writeFile(historyPath, JSON.stringify(history, null, 2), 'utf-8');
+          await fs.writeFile(
+            historyPath,
+            JSON.stringify(history, null, 2),
+            'utf-8',
+          );
         } catch (error) {
           console.error('Error saving conversation history:', error);
         }
-        
+
         return;
       }
     }
