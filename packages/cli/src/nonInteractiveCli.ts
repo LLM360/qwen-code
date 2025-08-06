@@ -51,6 +51,17 @@ export async function runNonInteractive(
   prompt_id: string,
 ): Promise<void> {
   await config.initialize();
+  
+  const workDir = process.cwd();
+  const saveHistory = async (chat: any): Promise<void> => {
+    try {
+      const history = chat.getHistory();
+      const historyPath = path.join(workDir, 'history.json');
+      await fs.writeFile(historyPath, JSON.stringify(history, null, 2), 'utf-8');
+    } catch (error) {
+      console.error('Error saving conversation history:', error);
+    }
+  };
   // Handle EPIPE errors when the output is piped to a command that closes early.
   process.stdout.on('error', (err: NodeJS.ErrnoException) => {
     if (err.code === 'EPIPE') {
@@ -107,6 +118,9 @@ export async function runNonInteractive(
         }
       }
 
+      // Save history after assistant response is complete
+      await saveHistory(chat);
+
       if (functionCalls.length > 0) {
         const toolResponseParts: Part[] = [];
 
@@ -152,27 +166,21 @@ export async function runNonInteractive(
             }
           }
         }
+
+        // Save history after tool execution batch is complete
+        await saveHistory(chat);
         currentMessages = [{ role: 'user', parts: toolResponseParts }];
       } else {
         process.stdout.write('\n'); // Ensure a final newline
 
-        // Auto-save conversation to history.json
-        const history = chat.getHistory();
-        const historyPath = path.join(process.cwd(), 'history.json');
-        try {
-          await fs.writeFile(
-            historyPath,
-            JSON.stringify(history, null, 2),
-            'utf-8',
-          );
-        } catch (error) {
-          console.error('Error saving conversation history:', error);
-        }
-
+        // Save final conversation history
+        await saveHistory(chat);
         return;
       }
     }
   } catch (error) {
+    // Save partial history before crashing
+    await saveHistory(chat);
     console.error(
       parseAndFormatApiError(
         error,
