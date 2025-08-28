@@ -43,13 +43,17 @@ import {
   DEFAULT_GEMINI_EMBEDDING_MODEL,
   DEFAULT_GEMINI_FLASH_MODEL,
 } from './models.js';
-import { ClearcutLogger } from '../telemetry/clearcut-logger/clearcut-logger.js';
+import { QwenLogger } from '../telemetry/qwen-logger/qwen-logger.js';
 import { shouldAttemptBrowserLaunch } from '../utils/browser.js';
 import { MCPOAuthConfig } from '../mcp/oauth-provider.js';
 import { IdeClient } from '../ide/ide-client.js';
+import type { Content } from '@google/genai';
+import { logIdeConnection } from '../telemetry/loggers.js';
+import { IdeConnectionEvent, IdeConnectionType } from '../telemetry/types.js';
 
 // Re-export OAuth config type
 export type { MCPOAuthConfig };
+import { WorkspaceContext } from '../utils/workspaceContext.js';
 
 export enum ApprovalMode {
   DEFAULT = 'default',
@@ -65,6 +69,10 @@ export interface BugCommandSettings {
   urlTemplate: string;
 }
 
+export interface ChatCompressionSettings {
+  contextPercentageThreshold?: number;
+}
+
 export interface SummarizeToolOutputSettings {
   tokenBudget?: number;
 }
@@ -77,10 +85,17 @@ export interface TelemetrySettings {
   outfile?: string;
 }
 
+export interface GitCoAuthorSettings {
+  enabled?: boolean;
+  name?: string;
+  email?: string;
+}
+
 export interface GeminiCLIExtension {
   name: string;
   version: string;
   isActive: boolean;
+  path: string;
 }
 export interface FileFilteringOptions {
   respectGitIgnore: boolean;
@@ -161,6 +176,7 @@ export interface ConfigParameters {
   contextFileName?: string | string[];
   accessibility?: AccessibilitySettings;
   telemetry?: TelemetrySettings;
+  gitCoAuthor?: GitCoAuthorSettings;
   usageStatisticsEnabled?: boolean;
   fileFiltering?: {
     respectGitIgnore?: boolean;
@@ -171,31 +187,42 @@ export interface ConfigParameters {
   proxy?: string;
   cwd: string;
   fileDiscoveryService?: FileDiscoveryService;
+  includeDirectories?: string[];
   bugCommand?: BugCommandSettings;
   model: string;
   extensionContextFilePaths?: string[];
   maxSessionTurns?: number;
   sessionTokenLimit?: number;
-  maxFolderItems?: number;
-  experimentalAcp?: boolean;
+  experimentalZedIntegration?: boolean;
   listExtensions?: boolean;
   extensions?: GeminiCLIExtension[];
   blockedMcpServers?: Array<{ name: string; extensionName: string }>;
   noBrowser?: boolean;
   summarizeToolOutput?: Record<string, SummarizeToolOutputSettings>;
+  folderTrustFeature?: boolean;
+  folderTrust?: boolean;
   ideMode?: boolean;
-  ideClient?: IdeClient;
   enableOpenAILogging?: boolean;
-  sampling_params?: Record<string, unknown>;
   systemPromptMappings?: Array<{
     baseUrls: string[];
     modelNames: string[];
     template: string;
   }>;
+  authType?: AuthType;
   contentGenerator?: {
     timeout?: number;
     maxRetries?: number;
+    samplingParams?: {
+      [key: string]: unknown;
+    };
   };
+  cliVersion?: string;
+  loadMemoryFromIncludeDirectories?: boolean;
+  // Web search providers
+  tavilyApiKey?: string;
+  chatCompression?: ChatCompressionSettings;
+  interactive?: boolean;
+  trustedFolder?: boolean;
 }
 
 export class Config {
@@ -206,6 +233,7 @@ export class Config {
   private readonly embeddingModel: string;
   private readonly sandbox: SandboxConfig | undefined;
   private readonly targetDir: string;
+  private workspaceContext: WorkspaceContext;
   private readonly debugMode: boolean;
   private readonly question: string | undefined;
   private readonly fullContext: boolean;
@@ -221,6 +249,7 @@ export class Config {
   private readonly showMemoryUsage: boolean;
   private readonly accessibility: AccessibilitySettings;
   private readonly telemetrySettings: TelemetrySettings;
+  private readonly gitCoAuthor: GitCoAuthorSettings;
   private readonly usageStatisticsEnabled: boolean;
   private geminiClient!: GeminiClient;
   private readonly fileFiltering: {
@@ -237,17 +266,18 @@ export class Config {
   private readonly model: string;
   private readonly extensionContextFilePaths: string[];
   private readonly noBrowser: boolean;
-  private readonly ideMode: boolean;
-  private readonly ideClient: IdeClient | undefined;
+  private readonly folderTrustFeature: boolean;
+  private readonly folderTrust: boolean;
+  private ideMode: boolean;
+  private ideClient: IdeClient;
+  private inFallbackMode = false;
   private readonly systemPromptMappings?: Array<{
     baseUrls?: string[];
     modelNames?: string[];
     template?: string;
   }>;
-  private modelSwitchedDuringSession: boolean = false;
   private readonly maxSessionTurns: number;
   private readonly sessionTokenLimit: number;
-  private readonly maxFolderItems: number;
   private readonly listExtensions: boolean;
   private readonly _extensions: GeminiCLIExtension[];
   private readonly _blockedMcpServers: Array<{
@@ -259,19 +289,32 @@ export class Config {
   private readonly summarizeToolOutput:
     | Record<string, SummarizeToolOutputSettings>
     | undefined;
-  private readonly experimentalAcp: boolean = false;
+  private authType?: AuthType;
   private readonly enableOpenAILogging: boolean;
-  private readonly sampling_params?: Record<string, unknown>;
   private readonly contentGenerator?: {
     timeout?: number;
     maxRetries?: number;
+    samplingParams?: Record<string, unknown>;
   };
+  private readonly cliVersion?: string;
+  private readonly experimentalZedIntegration: boolean = false;
+  private readonly loadMemoryFromIncludeDirectories: boolean = false;
+  private readonly tavilyApiKey?: string;
+  private readonly chatCompression: ChatCompressionSettings | undefined;
+  private readonly interactive: boolean;
+  private readonly trustedFolder: boolean | undefined;
+  private initialized: boolean = false;
+
   constructor(params: ConfigParameters) {
     this.sessionId = params.sessionId;
     this.embeddingModel =
       params.embeddingModel ?? DEFAULT_GEMINI_EMBEDDING_MODEL;
     this.sandbox = params.sandbox;
     this.targetDir = path.resolve(params.targetDir);
+    this.workspaceContext = new WorkspaceContext(
+      this.targetDir,
+      params.includeDirectories ?? [],
+    );
     this.debugMode = params.debugMode;
     this.question = params.question;
     this.fullContext = params.fullContext ?? false;
@@ -293,6 +336,11 @@ export class Config {
       logPrompts: params.telemetry?.logPrompts ?? true,
       outfile: params.telemetry?.outfile,
     };
+    this.gitCoAuthor = {
+      enabled: params.gitCoAuthor?.enabled ?? true,
+      name: params.gitCoAuthor?.name ?? 'Qwen-Coder',
+      email: params.gitCoAuthor?.email ?? 'qwen-coder@alibabacloud.com',
+    };
     this.usageStatisticsEnabled = params.usageStatisticsEnabled ?? true;
 
     this.fileFiltering = {
@@ -309,20 +357,32 @@ export class Config {
     this.model = params.model;
     this.extensionContextFilePaths = params.extensionContextFilePaths ?? [];
     this.maxSessionTurns = params.maxSessionTurns ?? -1;
-    this.sessionTokenLimit = params.sessionTokenLimit ?? 32000;
-    this.maxFolderItems = params.maxFolderItems ?? 20;
-    this.experimentalAcp = params.experimentalAcp ?? false;
+    this.sessionTokenLimit = params.sessionTokenLimit ?? -1;
+    this.experimentalZedIntegration =
+      params.experimentalZedIntegration ?? false;
     this.listExtensions = params.listExtensions ?? false;
     this._extensions = params.extensions ?? [];
     this._blockedMcpServers = params.blockedMcpServers ?? [];
     this.noBrowser = params.noBrowser ?? false;
     this.summarizeToolOutput = params.summarizeToolOutput;
+    this.folderTrustFeature = params.folderTrustFeature ?? false;
+    this.folderTrust = params.folderTrust ?? false;
     this.ideMode = params.ideMode ?? false;
-    this.ideClient = params.ideClient;
+    this.ideClient = IdeClient.getInstance();
     this.systemPromptMappings = params.systemPromptMappings;
+    this.authType = params.authType;
     this.enableOpenAILogging = params.enableOpenAILogging ?? false;
-    this.sampling_params = params.sampling_params;
     this.contentGenerator = params.contentGenerator;
+    this.cliVersion = params.cliVersion;
+
+    this.loadMemoryFromIncludeDirectories =
+      params.loadMemoryFromIncludeDirectories ?? false;
+    this.chatCompression = params.chatCompression;
+    this.interactive = params.interactive ?? false;
+    this.trustedFolder = params.trustedFolder;
+
+    // Web search
+    this.tavilyApiKey = params.tavilyApiKey;
 
     if (params.contextFileName) {
       setGeminiMdFilename(params.contextFileName);
@@ -333,7 +393,7 @@ export class Config {
     }
 
     if (this.getUsageStatisticsEnabled()) {
-      ClearcutLogger.getInstance(this)?.logStartSessionEvent(
+      QwenLogger.getInstance(this)?.logStartSessionEvent(
         new StartSessionEvent(this),
       );
     } else {
@@ -341,7 +401,14 @@ export class Config {
     }
   }
 
+  /**
+   * Must only be called once, throws if called again.
+   */
   async initialize(): Promise<void> {
+    if (this.initialized) {
+      throw Error('Config was already initialized');
+    }
+    this.initialized = true;
     // Initialize centralized FileDiscoveryService
     this.getFileService();
     if (this.getCheckpointingEnabled()) {
@@ -352,20 +419,51 @@ export class Config {
   }
 
   async refreshAuth(authMethod: AuthType) {
-    this.contentGeneratorConfig = createContentGeneratorConfig(
+    // Save the current conversation history before creating a new client
+    let existingHistory: Content[] = [];
+    if (this.geminiClient && this.geminiClient.isInitialized()) {
+      existingHistory = this.geminiClient.getHistory();
+    }
+
+    // Create new content generator config
+    const newContentGeneratorConfig = createContentGeneratorConfig(
       this,
       authMethod,
     );
 
-    this.geminiClient = new GeminiClient(this);
-    await this.geminiClient.initialize(this.contentGeneratorConfig);
+    // Create and initialize new client in local variable first
+    const newGeminiClient = new GeminiClient(this);
+    await newGeminiClient.initialize(newContentGeneratorConfig);
+
+    // Vertex and Genai have incompatible encryption and sending history with
+    // throughtSignature from Genai to Vertex will fail, we need to strip them
+    const fromGenaiToVertex =
+      this.contentGeneratorConfig?.authType === AuthType.USE_GEMINI &&
+      authMethod === AuthType.LOGIN_WITH_GOOGLE;
+
+    // Only assign to instance properties after successful initialization
+    this.contentGeneratorConfig = newContentGeneratorConfig;
+    this.geminiClient = newGeminiClient;
+
+    // Restore the conversation history to the new client
+    if (existingHistory.length > 0) {
+      this.geminiClient.setHistory(existingHistory, {
+        stripThoughts: fromGenaiToVertex,
+      });
+    }
 
     // Reset the session flag since we're explicitly changing auth and using default model
-    this.modelSwitchedDuringSession = false;
+    this.inFallbackMode = false;
+
+    this.authType = authMethod;
   }
 
   getSessionId(): string {
     return this.sessionId;
+  }
+
+  shouldLoadMemoryFromIncludeDirectories(): boolean {
+    return this.loadMemoryFromIncludeDirectories;
   }
 
   getContentGeneratorConfig(): ContentGeneratorConfig {
@@ -379,19 +477,15 @@ export class Config {
   setModel(newModel: string): void {
     if (this.contentGeneratorConfig) {
       this.contentGeneratorConfig.model = newModel;
-      this.modelSwitchedDuringSession = true;
     }
   }
 
-  isModelSwitchedDuringSession(): boolean {
-    return this.modelSwitchedDuringSession;
+  isInFallbackMode(): boolean {
+    return this.inFallbackMode;
   }
 
-  resetModelToDefault(): void {
-    if (this.contentGeneratorConfig) {
-      this.contentGeneratorConfig.model = this.model; // Reset to the original default model
-      this.modelSwitchedDuringSession = false;
-    }
+  setFallbackMode(active: boolean): void {
+    this.inFallbackMode = active;
   }
 
   setFlashFallbackHandler(handler: FlashFallbackHandler): void {
@@ -404,10 +498,6 @@ export class Config {
 
   getSessionTokenLimit(): number {
     return this.sessionTokenLimit;
-  }
-
-  getMaxFolderItems(): number {
-    return this.maxFolderItems;
   }
 
   setQuotaErrorOccurred(value: boolean): void {
@@ -426,12 +516,27 @@ export class Config {
     return this.sandbox;
   }
 
+  isRestrictiveSandbox(): boolean {
+    const sandboxConfig = this.getSandbox();
+    const seatbeltProfile = process.env.SEATBELT_PROFILE;
+    return (
+      !!sandboxConfig &&
+      sandboxConfig.command === 'sandbox-exec' &&
+      !!seatbeltProfile &&
+      seatbeltProfile.startsWith('restrictive-')
+    );
+  }
+
   getTargetDir(): string {
     return this.targetDir;
   }
 
   getProjectRoot(): string {
     return this.targetDir;
+  }
+
+  getWorkspaceContext(): WorkspaceContext {
+    return this.workspaceContext;
   }
 
   getToolRegistry(): Promise<ToolRegistry> {
@@ -445,6 +550,7 @@ export class Config {
   getDebugMode(): boolean {
     return this.debugMode;
   }
+
   getQuestion(): string | undefined {
     return this.question;
   }
@@ -529,6 +635,10 @@ export class Config {
     return this.telemetrySettings.outfile;
   }
 
+  getGitCoAuthor(): GitCoAuthorSettings {
+    return this.gitCoAuthor;
+  }
+
   getGeminiClient(): GeminiClient {
     return this.geminiClient;
   }
@@ -590,8 +700,8 @@ export class Config {
     return this.extensionContextFilePaths;
   }
 
-  getExperimentalAcp(): boolean {
-    return this.experimentalAcp;
+  getExperimentalZedIntegration(): boolean {
+    return this.experimentalZedIntegration;
   }
 
   getListExtensions(): boolean {
@@ -620,20 +730,51 @@ export class Config {
     return this.summarizeToolOutput;
   }
 
+  // Web search provider configuration
+  getTavilyApiKey(): string | undefined {
+    return this.tavilyApiKey;
+  }
+
+  getIdeClient(): IdeClient {
+    return this.ideClient;
+  }
+
   getIdeMode(): boolean {
     return this.ideMode;
   }
 
-  getIdeClient(): IdeClient | undefined {
-    return this.ideClient;
+  getFolderTrustFeature(): boolean {
+    return this.folderTrustFeature;
+  }
+
+  getFolderTrust(): boolean {
+    return this.folderTrust;
+  }
+
+  isTrustedFolder(): boolean | undefined {
+    return this.trustedFolder;
+  }
+
+  setIdeMode(value: boolean): void {
+    this.ideMode = value;
+  }
+
+  async setIdeModeAndSyncConnection(value: boolean): Promise<void> {
+    this.ideMode = value;
+    if (value) {
+      await this.ideClient.connect();
+      logIdeConnection(this, new IdeConnectionEvent(IdeConnectionType.SESSION));
+    } else {
+      await this.ideClient.disconnect();
+    }
+  }
+
+  getAuthType(): AuthType | undefined {
+    return this.authType;
   }
 
   getEnableOpenAILogging(): boolean {
     return this.enableOpenAILogging;
-  }
-
-  getSamplingParams(): Record<string, unknown> | undefined {
-    return this.sampling_params;
   }
 
   getContentGeneratorTimeout(): number | undefined {
@@ -644,6 +785,16 @@ export class Config {
     return this.contentGenerator?.maxRetries;
   }
 
+  getContentGeneratorSamplingParams(): ContentGeneratorConfig['samplingParams'] {
+    return this.contentGenerator?.samplingParams as
+      | ContentGeneratorConfig['samplingParams']
+      | undefined;
+  }
+
+  getCliVersion(): string | undefined {
+    return this.cliVersion;
+  }
+
   getSystemPromptMappings():
     | Array<{
         baseUrls?: string[];
@@ -652,6 +803,14 @@ export class Config {
       }>
     | undefined {
     return this.systemPromptMappings;
+  }
+
+  getChatCompression(): ChatCompressionSettings | undefined {
+    return this.chatCompression;
+  }
+
+  isInteractive(): boolean {
+    return this.interactive;
   }
 
   async getGitService(): Promise<GitService> {
@@ -708,7 +867,10 @@ export class Config {
     registerCoreTool(ReadManyFilesTool, this);
     registerCoreTool(ShellTool, this);
     registerCoreTool(MemoryTool);
-    registerCoreTool(WebSearchTool, this);
+    // Conditionally register web search tool only if Tavily API key is set
+    if (this.getTavilyApiKey()) {
+      registerCoreTool(WebSearchTool, this);
+    }
 
     await registry.discoverAllTools();
     return registry;

@@ -1,6 +1,6 @@
 /**
  * @license
- * Copyright 2025 Google LLC
+ * Copyright 2025 Qwen
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -20,12 +20,28 @@ import {
   FunctionCall,
   FunctionResponse,
 } from '@google/genai';
-import { ContentGenerator } from './contentGenerator.js';
+import {
+  AuthType,
+  ContentGenerator,
+  ContentGeneratorConfig,
+} from './contentGenerator.js';
 import OpenAI from 'openai';
-import { logApiResponse } from '../telemetry/loggers.js';
-import { ApiResponseEvent } from '../telemetry/types.js';
+import { logApiError, logApiResponse } from '../telemetry/loggers.js';
+import { ApiErrorEvent, ApiResponseEvent } from '../telemetry/types.js';
 import { Config } from '../config/config.js';
 import { openaiLogger } from '../utils/openaiLogger.js';
+import { safeJsonParse } from '../utils/safeJsonParse.js';
+
+// Extended types to support cache_control
+interface ChatCompletionContentPartTextWithCache
+  extends OpenAI.Chat.ChatCompletionContentPartText {
+  cache_control?: { type: 'ephemeral' };
+}
+
+type ChatCompletionContentPartWithCache =
+  | ChatCompletionContentPartTextWithCache
+  | OpenAI.Chat.ChatCompletionContentPartImage
+  | OpenAI.Chat.ChatCompletionContentPartRefusal;
 
 // OpenAI API type definitions for logging
 interface OpenAIToolCall {
@@ -37,9 +53,15 @@ interface OpenAIToolCall {
   };
 }
 
+interface OpenAIContentItem {
+  type: 'text';
+  text: string;
+  cache_control?: { type: 'ephemeral' };
+}
+
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  content: string | null | OpenAIContentItem[];
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
 }
@@ -59,15 +81,6 @@ interface OpenAIChoice {
   finish_reason: string;
 }
 
-interface OpenAIRequestFormat {
-  model: string;
-  messages: OpenAIMessage[];
-  temperature?: number;
-  max_tokens?: number;
-  top_p?: number;
-  tools?: unknown[];
-}
-
 interface OpenAIResponseFormat {
   id: string;
   object: string;
@@ -78,8 +91,9 @@ interface OpenAIResponseFormat {
 }
 
 export class OpenAIContentGenerator implements ContentGenerator {
-  private client: OpenAI;
+  protected client: OpenAI;
   private model: string;
+  private contentGeneratorConfig: ContentGeneratorConfig;
   private config: Config;
   private streamingToolCalls: Map<
     number,
@@ -90,46 +104,57 @@ export class OpenAIContentGenerator implements ContentGenerator {
     }
   > = new Map();
 
-  constructor(apiKey: string, model: string, config: Config) {
-    this.model = model;
-    this.config = config;
-    const baseURL = process.env.OPENAI_BASE_URL || '';
+  constructor(
+    contentGeneratorConfig: ContentGeneratorConfig,
+    gcConfig: Config,
+  ) {
+    this.model = contentGeneratorConfig.model;
+    this.contentGeneratorConfig = contentGeneratorConfig;
+    this.config = gcConfig;
 
-    // Configure timeout settings - using progressive timeouts
-    const timeoutConfig = {
-      // Base timeout for most requests (2 minutes)
-      timeout: 120000,
-      // Maximum retries for failed requests
-      maxRetries: 3,
-      // HTTP client options
-      httpAgent: undefined, // Let the client use default agent
-    };
-
-    // Allow config to override timeout settings
-    const contentGeneratorConfig = this.config.getContentGeneratorConfig();
-    if (contentGeneratorConfig?.timeout) {
-      timeoutConfig.timeout = contentGeneratorConfig.timeout;
-    }
-    if (contentGeneratorConfig?.maxRetries !== undefined) {
-      timeoutConfig.maxRetries = contentGeneratorConfig.maxRetries;
-    }
+    const version = gcConfig.getCliVersion() || 'unknown';
+    const userAgent = `QwenCode/${version} (${process.platform}; ${process.arch})`;
 
     // Check if using OpenRouter and add required headers
-    const isOpenRouter = baseURL.includes('openrouter.ai');
-    const defaultHeaders = isOpenRouter
-      ? {
-          'HTTP-Referer': 'https://github.com/QwenLM/qwen-code.git',
-          'X-Title': 'Qwen Code',
-        }
-      : undefined;
+    const isOpenRouterProvider = this.isOpenRouterProvider();
+    const isDashScopeProvider = this.isDashScopeProvider();
+
+    const defaultHeaders = {
+      'User-Agent': userAgent,
+      ...(isOpenRouterProvider
+        ? {
+            'HTTP-Referer': 'https://github.com/QwenLM/qwen-code.git',
+            'X-Title': 'Qwen Code',
+          }
+        : isDashScopeProvider
+          ? {
+              'X-DashScope-CacheControl': 'enable',
+              'X-DashScope-UserAgent': userAgent,
+              'X-DashScope-AuthType': contentGeneratorConfig.authType,
+            }
+          : {}),
+    };
 
     this.client = new OpenAI({
-      apiKey,
-      baseURL,
-      timeout: timeoutConfig.timeout,
-      maxRetries: timeoutConfig.maxRetries,
+      apiKey: contentGeneratorConfig.apiKey,
+      baseURL: contentGeneratorConfig.baseUrl,
+      timeout: contentGeneratorConfig.timeout ?? 120000,
+      maxRetries: contentGeneratorConfig.maxRetries ?? 3,
       defaultHeaders,
     });
+  }
+
+  /**
+   * Hook for subclasses to customize error handling behavior
+   * @param error The error that occurred
+   * @param request The original request
+   * @returns true if error logging should be suppressed, false otherwise
+   */
+  protected shouldSuppressErrorLogging(
+    _error: unknown,
+    _request: GenerateContentParameters,
+  ): boolean {
+    return false; // Default behavior: never suppress error logging
   }
 
   /**
@@ -165,33 +190,106 @@ export class OpenAIContentGenerator implements ContentGenerator {
     );
   }
 
+  private isOpenRouterProvider(): boolean {
+    const baseURL = this.contentGeneratorConfig.baseUrl || '';
+    return baseURL.includes('openrouter.ai');
+  }
+
+  /**
+   * Determine if this is a DashScope provider.
+   * DashScope providers include QWEN_OAUTH auth type or specific DashScope base URLs.
+   *
+   * @returns true if this is a DashScope provider, false otherwise
+   */
+  private isDashScopeProvider(): boolean {
+    const authType = this.contentGeneratorConfig.authType;
+    const baseUrl = this.contentGeneratorConfig.baseUrl;
+
+    return (
+      authType === AuthType.QWEN_OAUTH ||
+      baseUrl === 'https://dashscope.aliyuncs.com/compatible-mode/v1' ||
+      baseUrl === 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+    );
+  }
+
+  /**
+   * Build metadata object for OpenAI API requests.
+   *
+   * @param userPromptId The user prompt ID to include in metadata
+   * @returns metadata object if shouldIncludeMetadata() returns true, undefined otherwise
+   */
+  private buildMetadata(
+    userPromptId: string,
+  ): { metadata: { sessionId?: string; promptId: string } } | undefined {
+    if (!this.isDashScopeProvider()) {
+      return undefined;
+    }
+
+    return {
+      metadata: {
+        sessionId: this.config.getSessionId?.(),
+        promptId: userPromptId,
+      },
+    };
+  }
+
+  private async buildCreateParams(
+    request: GenerateContentParameters,
+    userPromptId: string,
+    streaming: boolean = false,
+  ): Promise<Parameters<typeof this.client.chat.completions.create>[0]> {
+    let messages = this.convertToOpenAIFormat(request);
+
+    // Add cache control to system and last messages for DashScope providers
+    // Only add cache control to system message for non-streaming requests
+    if (this.isDashScopeProvider()) {
+      messages = this.addDashScopeCacheControl(
+        messages,
+        streaming ? 'both' : 'system',
+      );
+    }
+
+    // Build sampling parameters with clear priority:
+    // 1. Request-level parameters (highest priority)
+    // 2. Config-level sampling parameters (medium priority)
+    // 3. Default values (lowest priority)
+    const samplingParams = this.buildSamplingParameters(request);
+
+    const createParams: Parameters<
+      typeof this.client.chat.completions.create
+    >[0] = {
+      model: this.model,
+      messages,
+      ...samplingParams,
+      ...(this.buildMetadata(userPromptId) || {}),
+    };
+
+    if (request.config?.tools) {
+      createParams.tools = await this.convertGeminiToolsToOpenAI(
+        request.config.tools,
+      );
+    }
+
+    if (streaming) {
+      createParams.stream = true;
+      createParams.stream_options = { include_usage: true };
+    }
+
+    return createParams;
+  }
+
   async generateContent(
     request: GenerateContentParameters,
+    userPromptId: string,
   ): Promise<GenerateContentResponse> {
     const startTime = Date.now();
-    const messages = this.convertToOpenAIFormat(request);
+    const createParams = await this.buildCreateParams(
+      request,
+      userPromptId,
+      false,
+    );
 
     try {
-      // Build sampling parameters with clear priority:
-      // 1. Request-level parameters (highest priority)
-      // 2. Config-level sampling parameters (medium priority)
-      // 3. Default values (lowest priority)
-      const samplingParams = this.buildSamplingParameters(request);
-
-      const createParams: Parameters<
-        typeof this.client.chat.completions.create
-      >[0] = {
-        model: this.model,
-        messages,
-        ...samplingParams,
-      };
-
-      if (request.config?.tools) {
-        createParams.tools = await this.convertGeminiToolsToOpenAI(
-          request.config.tools,
-        );
-      }
-      // console.log('createParams', createParams);
       const completion = (await this.client.chat.completions.create(
         createParams,
       )) as OpenAI.Chat.ChatCompletion;
@@ -201,18 +299,19 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
       // Log API response event for UI telemetry
       const responseEvent = new ApiResponseEvent(
+        response.responseId || 'unknown',
         this.model,
         durationMs,
-        `openai-${Date.now()}`, // Generate a prompt ID
-        this.config.getContentGeneratorConfig()?.authType,
+        userPromptId,
+        this.contentGeneratorConfig.authType,
         response.usageMetadata,
       );
 
       logApiResponse(this.config, responseEvent);
 
       // Log interaction if enabled
-      if (this.config.getContentGeneratorConfig()?.enableOpenAILogging) {
-        const openaiRequest = await this.convertGeminiRequestToOpenAI(request);
+      if (this.contentGeneratorConfig.enableOpenAILogging) {
+        const openaiRequest = createParams;
         const openaiResponse = this.convertGeminiResponseToOpenAI(response);
         await openaiLogger.logInteraction(openaiRequest, openaiResponse);
       }
@@ -229,53 +328,35 @@ export class OpenAIContentGenerator implements ContentGenerator {
           ? error.message
           : String(error);
 
-      // Estimate token usage even when there's an error
-      // This helps track costs and usage even for failed requests
-      let estimatedUsage;
-      try {
-        const tokenCountResult = await this.countTokens({
-          contents: request.contents,
-          model: this.model,
-        });
-        estimatedUsage = {
-          promptTokenCount: tokenCountResult.totalTokens,
-          candidatesTokenCount: 0, // No completion tokens since request failed
-          totalTokenCount: tokenCountResult.totalTokens,
-        };
-      } catch {
-        // If token counting also fails, provide a minimal estimate
-        const contentStr = JSON.stringify(request.contents);
-        const estimatedTokens = Math.ceil(contentStr.length / 4);
-        estimatedUsage = {
-          promptTokenCount: estimatedTokens,
-          candidatesTokenCount: 0,
-          totalTokenCount: estimatedTokens,
-        };
-      }
-
-      // Log API error event for UI telemetry with estimated usage
-      const errorEvent = new ApiResponseEvent(
+      // Log API error event for UI telemetry
+      const errorEvent = new ApiErrorEvent(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (error as any).requestID || 'unknown',
         this.model,
-        durationMs,
-        `openai-${Date.now()}`, // Generate a prompt ID
-        this.config.getContentGeneratorConfig()?.authType,
-        estimatedUsage,
-        undefined,
         errorMessage,
+        durationMs,
+        userPromptId,
+        this.contentGeneratorConfig.authType,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (error as any).type,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (error as any).code,
       );
-      logApiResponse(this.config, errorEvent);
+      logApiError(this.config, errorEvent);
 
       // Log error interaction if enabled
-      if (this.config.getContentGeneratorConfig()?.enableOpenAILogging) {
-        const openaiRequest = await this.convertGeminiRequestToOpenAI(request);
+      if (this.contentGeneratorConfig.enableOpenAILogging) {
         await openaiLogger.logInteraction(
-          openaiRequest,
+          createParams,
           undefined,
           error as Error,
         );
       }
 
-      console.error('OpenAI API Error:', errorMessage);
+      // Allow subclasses to suppress error logging for specific scenarios
+      if (!this.shouldSuppressErrorLogging(error, request)) {
+        console.error('OpenAI API Error:', errorMessage);
+      }
 
       // Provide helpful timeout-specific error message
       if (isTimeoutError) {
@@ -288,38 +369,22 @@ export class OpenAIContentGenerator implements ContentGenerator {
         );
       }
 
-      throw new Error(`OpenAI API error: ${errorMessage}`);
+      throw error;
     }
   }
 
   async generateContentStream(
     request: GenerateContentParameters,
+    userPromptId: string,
   ): Promise<AsyncGenerator<GenerateContentResponse>> {
     const startTime = Date.now();
-    const messages = this.convertToOpenAIFormat(request);
+    const createParams = await this.buildCreateParams(
+      request,
+      userPromptId,
+      true,
+    );
 
     try {
-      // Build sampling parameters with clear priority
-      const samplingParams = this.buildSamplingParameters(request);
-
-      const createParams: Parameters<
-        typeof this.client.chat.completions.create
-      >[0] = {
-        model: this.model,
-        messages,
-        ...samplingParams,
-        stream: true,
-        stream_options: { include_usage: true },
-      };
-
-      if (request.config?.tools) {
-        createParams.tools = await this.convertGeminiToolsToOpenAI(
-          request.config.tools,
-        );
-      }
-
-      // console.log('createParams', createParams);
-
       const stream = (await this.client.chat.completions.create(
         createParams,
       )) as AsyncIterable<OpenAI.Chat.ChatCompletionChunk>;
@@ -347,19 +412,19 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
           // Log API response event for UI telemetry
           const responseEvent = new ApiResponseEvent(
+            responses[responses.length - 1]?.responseId || 'unknown',
             this.model,
             durationMs,
-            `openai-stream-${Date.now()}`, // Generate a prompt ID
-            this.config.getContentGeneratorConfig()?.authType,
+            userPromptId,
+            this.contentGeneratorConfig.authType,
             finalUsageMetadata,
           );
 
           logApiResponse(this.config, responseEvent);
 
           // Log interaction if enabled (same as generateContent method)
-          if (this.config.getContentGeneratorConfig()?.enableOpenAILogging) {
-            const openaiRequest =
-              await this.convertGeminiRequestToOpenAI(request);
+          if (this.contentGeneratorConfig.enableOpenAILogging) {
+            const openaiRequest = createParams;
             // For streaming, we combine all responses into a single response for logging
             const combinedResponse =
               this.combineStreamResponsesForLogging(responses);
@@ -378,47 +443,26 @@ export class OpenAIContentGenerator implements ContentGenerator {
               ? error.message
               : String(error);
 
-          // Estimate token usage even when there's an error in streaming
-          let estimatedUsage;
-          try {
-            const tokenCountResult = await this.countTokens({
-              contents: request.contents,
-              model: this.model,
-            });
-            estimatedUsage = {
-              promptTokenCount: tokenCountResult.totalTokens,
-              candidatesTokenCount: 0, // No completion tokens since request failed
-              totalTokenCount: tokenCountResult.totalTokens,
-            };
-          } catch {
-            // If token counting also fails, provide a minimal estimate
-            const contentStr = JSON.stringify(request.contents);
-            const estimatedTokens = Math.ceil(contentStr.length / 4);
-            estimatedUsage = {
-              promptTokenCount: estimatedTokens,
-              candidatesTokenCount: 0,
-              totalTokenCount: estimatedTokens,
-            };
-          }
-
-          // Log API error event for UI telemetry with estimated usage
-          const errorEvent = new ApiResponseEvent(
+          // Log API error event for UI telemetry
+          const errorEvent = new ApiErrorEvent(
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (error as any).requestID || 'unknown',
             this.model,
-            durationMs,
-            `openai-stream-${Date.now()}`, // Generate a prompt ID
-            this.config.getContentGeneratorConfig()?.authType,
-            estimatedUsage,
-            undefined,
             errorMessage,
+            durationMs,
+            userPromptId,
+            this.contentGeneratorConfig.authType,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (error as any).type,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (error as any).code,
           );
-          logApiResponse(this.config, errorEvent);
+          logApiError(this.config, errorEvent);
 
           // Log error interaction if enabled
-          if (this.config.getContentGeneratorConfig()?.enableOpenAILogging) {
-            const openaiRequest =
-              await this.convertGeminiRequestToOpenAI(request);
+          if (this.contentGeneratorConfig.enableOpenAILogging) {
             await openaiLogger.logInteraction(
-              openaiRequest,
+              createParams,
               undefined,
               error as Error,
             );
@@ -451,42 +495,26 @@ export class OpenAIContentGenerator implements ContentGenerator {
           ? error.message
           : String(error);
 
-      // Estimate token usage even when there's an error in streaming setup
-      let estimatedUsage;
-      try {
-        const tokenCountResult = await this.countTokens({
-          contents: request.contents,
-          model: this.model,
-        });
-        estimatedUsage = {
-          promptTokenCount: tokenCountResult.totalTokens,
-          candidatesTokenCount: 0, // No completion tokens since request failed
-          totalTokenCount: tokenCountResult.totalTokens,
-        };
-      } catch {
-        // If token counting also fails, provide a minimal estimate
-        const contentStr = JSON.stringify(request.contents);
-        const estimatedTokens = Math.ceil(contentStr.length / 4);
-        estimatedUsage = {
-          promptTokenCount: estimatedTokens,
-          candidatesTokenCount: 0,
-          totalTokenCount: estimatedTokens,
-        };
-      }
-
-      // Log API error event for UI telemetry with estimated usage
-      const errorEvent = new ApiResponseEvent(
+      // Log API error event for UI telemetry
+      const errorEvent = new ApiErrorEvent(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (error as any).requestID || 'unknown',
         this.model,
-        durationMs,
-        `openai-stream-${Date.now()}`, // Generate a prompt ID
-        this.config.getContentGeneratorConfig()?.authType,
-        estimatedUsage,
-        undefined,
         errorMessage,
+        durationMs,
+        userPromptId,
+        this.contentGeneratorConfig.authType,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (error as any).type,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (error as any).code,
       );
-      logApiResponse(this.config, errorEvent);
+      logApiError(this.config, errorEvent);
 
-      console.error('OpenAI API Streaming Error:', errorMessage);
+      // Allow subclasses to suppress error logging for specific scenarios
+      if (!this.shouldSuppressErrorLogging(error, request)) {
+        console.error('OpenAI API Streaming Error:', errorMessage);
+      }
 
       // Provide helpful timeout-specific error message for streaming setup
       if (isTimeoutError) {
@@ -499,7 +527,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
         );
       }
 
-      throw new Error(`OpenAI API error: ${errorMessage}`);
+      throw error;
     }
   }
 
@@ -728,6 +756,16 @@ export class OpenAIContentGenerator implements ContentGenerator {
     return convertTypes(converted) as Record<string, unknown> | undefined;
   }
 
+  /**
+   * Converts Gemini tools to OpenAI format for API compatibility.
+   * Handles both Gemini tools (using 'parameters' field) and MCP tools (using 'parametersJsonSchema' field).
+   *
+   * Gemini tools use a custom parameter format that needs conversion to OpenAI JSON Schema format.
+   * MCP tools already use JSON Schema format in the parametersJsonSchema field and can be used directly.
+   *
+   * @param geminiTools - Array of Gemini tools to convert
+   * @returns Promise resolving to array of OpenAI-compatible tools
+   */
   private async convertGeminiToolsToOpenAI(
     geminiTools: ToolListUnion,
   ): Promise<OpenAI.Chat.ChatCompletionTool[]> {
@@ -748,14 +786,31 @@ export class OpenAIContentGenerator implements ContentGenerator {
       if (actualTool.functionDeclarations) {
         for (const func of actualTool.functionDeclarations) {
           if (func.name && func.description) {
+            let parameters: Record<string, unknown> | undefined;
+
+            // Handle both Gemini tools (parameters) and MCP tools (parametersJsonSchema)
+            if (func.parametersJsonSchema) {
+              // MCP tool format - use parametersJsonSchema directly
+              if (func.parametersJsonSchema) {
+                // Create a shallow copy to avoid mutating the original object
+                const paramsCopy = {
+                  ...(func.parametersJsonSchema as Record<string, unknown>),
+                };
+                parameters = paramsCopy;
+              }
+            } else if (func.parameters) {
+              // Gemini tool format - convert parameters to OpenAI format
+              parameters = this.convertGeminiParametersToOpenAI(
+                func.parameters as Record<string, unknown>,
+              );
+            }
+
             openAITools.push({
               type: 'function',
               function: {
                 name: func.name,
                 description: func.description,
-                parameters: this.convertGeminiParametersToOpenAI(
-                  (func.parameters || {}) as Record<string, unknown>,
-                ),
+                parameters,
               },
             });
           }
@@ -905,7 +960,113 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
     // Clean up orphaned tool calls and merge consecutive assistant messages
     const cleanedMessages = this.cleanOrphanedToolCalls(messages);
-    return this.mergeConsecutiveAssistantMessages(cleanedMessages);
+    const mergedMessages =
+      this.mergeConsecutiveAssistantMessages(cleanedMessages);
+
+    return mergedMessages;
+  }
+
+  /**
+   * Add cache control flag to specified message(s) for DashScope providers
+   */
+  private addDashScopeCacheControl(
+    messages: OpenAI.Chat.ChatCompletionMessageParam[],
+    target: 'system' | 'last' | 'both' = 'both',
+  ): OpenAI.Chat.ChatCompletionMessageParam[] {
+    if (!this.isDashScopeProvider() || messages.length === 0) {
+      return messages;
+    }
+
+    let updatedMessages = [...messages];
+
+    // Add cache control to system message if requested
+    if (target === 'system' || target === 'both') {
+      updatedMessages = this.addCacheControlToMessage(
+        updatedMessages,
+        'system',
+      );
+    }
+
+    // Add cache control to last message if requested
+    if (target === 'last' || target === 'both') {
+      updatedMessages = this.addCacheControlToMessage(updatedMessages, 'last');
+    }
+
+    return updatedMessages;
+  }
+
+  /**
+   * Helper method to add cache control to a specific message
+   */
+  private addCacheControlToMessage(
+    messages: OpenAI.Chat.ChatCompletionMessageParam[],
+    target: 'system' | 'last',
+  ): OpenAI.Chat.ChatCompletionMessageParam[] {
+    const updatedMessages = [...messages];
+    let messageIndex: number;
+
+    if (target === 'system') {
+      // Find the first system message
+      messageIndex = messages.findIndex((msg) => msg.role === 'system');
+      if (messageIndex === -1) {
+        return updatedMessages;
+      }
+    } else {
+      // Get the last message
+      messageIndex = messages.length - 1;
+    }
+
+    const message = updatedMessages[messageIndex];
+
+    // Only process messages that have content
+    if ('content' in message && message.content !== null) {
+      if (typeof message.content === 'string') {
+        // Convert string content to array format with cache control
+        const messageWithArrayContent = {
+          ...message,
+          content: [
+            {
+              type: 'text',
+              text: message.content,
+              cache_control: { type: 'ephemeral' },
+            } as ChatCompletionContentPartTextWithCache,
+          ],
+        };
+        updatedMessages[messageIndex] =
+          messageWithArrayContent as OpenAI.Chat.ChatCompletionMessageParam;
+      } else if (Array.isArray(message.content)) {
+        // If content is already an array, add cache_control to the last item
+        const contentArray = [
+          ...message.content,
+        ] as ChatCompletionContentPartWithCache[];
+        if (contentArray.length > 0) {
+          const lastItem = contentArray[contentArray.length - 1];
+          if (lastItem.type === 'text') {
+            // Add cache_control to the last text item
+            contentArray[contentArray.length - 1] = {
+              ...lastItem,
+              cache_control: { type: 'ephemeral' },
+            } as ChatCompletionContentPartTextWithCache;
+          } else {
+            // If the last item is not text, add a new text item with cache_control
+            contentArray.push({
+              type: 'text',
+              text: '',
+              cache_control: { type: 'ephemeral' },
+            } as ChatCompletionContentPartTextWithCache);
+          }
+
+          const messageWithCache = {
+            ...message,
+            content: contentArray,
+          };
+          updatedMessages[messageIndex] =
+            messageWithCache as OpenAI.Chat.ChatCompletionMessageParam;
+        }
+      }
+    }
+
+    return updatedMessages;
   }
 
   /**
@@ -1134,12 +1295,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
         if (toolCall.function) {
           let args: Record<string, unknown> = {};
           if (toolCall.function.arguments) {
-            try {
-              args = JSON.parse(toolCall.function.arguments);
-            } catch (error) {
-              console.error('Failed to parse function arguments:', error);
-              args = {};
-            }
+            args = safeJsonParse(toolCall.function.arguments, {});
           }
 
           parts.push({
@@ -1215,7 +1371,9 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
       // Handle text content
       if (choice.delta?.content) {
-        parts.push({ text: choice.delta.content });
+        if (typeof choice.delta.content === 'string') {
+          parts.push({ text: choice.delta.content });
+        }
       }
 
       // Handle tool calls - only accumulate during streaming, emit when complete
@@ -1235,10 +1393,36 @@ export class OpenAIContentGenerator implements ContentGenerator {
             accumulatedCall.id = toolCall.id;
           }
           if (toolCall.function?.name) {
+            // If this is a new function name, reset the arguments
+            if (accumulatedCall.name !== toolCall.function.name) {
+              accumulatedCall.arguments = '';
+            }
             accumulatedCall.name = toolCall.function.name;
           }
           if (toolCall.function?.arguments) {
-            accumulatedCall.arguments += toolCall.function.arguments;
+            // Check if we already have a complete JSON object
+            const currentArgs = accumulatedCall.arguments;
+            const newArgs = toolCall.function.arguments;
+
+            // If current arguments already form a complete JSON and new arguments start a new object,
+            // this indicates a new tool call with the same name
+            let shouldReset = false;
+            if (currentArgs && newArgs.trim().startsWith('{')) {
+              try {
+                JSON.parse(currentArgs);
+                // If we can parse current arguments as complete JSON and new args start with {,
+                // this is likely a new tool call
+                shouldReset = true;
+              } catch {
+                // Current arguments are not complete JSON, continue accumulating
+              }
+            }
+
+            if (shouldReset) {
+              accumulatedCall.arguments = newArgs;
+            } else {
+              accumulatedCall.arguments += newArgs;
+            }
           }
         }
       }
@@ -1251,19 +1435,14 @@ export class OpenAIContentGenerator implements ContentGenerator {
           if (accumulatedCall.name) {
             let args: Record<string, unknown> = {};
             if (accumulatedCall.arguments) {
-              try {
-                args = JSON.parse(accumulatedCall.arguments);
-              } catch (error) {
-                console.error(
-                  'Failed to parse final tool call arguments:',
-                  error,
-                );
-              }
+              args = safeJsonParse(accumulatedCall.arguments, {});
             }
 
             parts.push({
               functionCall: {
-                id: accumulatedCall.id,
+                id:
+                  accumulatedCall.id ||
+                  `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
                 name: accumulatedCall.name,
                 args,
               },
@@ -1339,8 +1518,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
   private buildSamplingParameters(
     request: GenerateContentParameters,
   ): Record<string, unknown> {
-    const configSamplingParams =
-      this.config.getContentGeneratorConfig()?.samplingParams;
+    const configSamplingParams = this.contentGeneratorConfig.samplingParams;
 
     const params = {
       // Temperature: config > request > default
@@ -1403,313 +1581,6 @@ export class OpenAIContentGenerator implements ContentGenerator {
   }
 
   /**
-   * Convert Gemini request format to OpenAI chat completion format for logging
-   */
-  private async convertGeminiRequestToOpenAI(
-    request: GenerateContentParameters,
-  ): Promise<OpenAIRequestFormat> {
-    const messages: OpenAIMessage[] = [];
-
-    // Handle system instruction
-    if (request.config?.systemInstruction) {
-      const systemInstruction = request.config.systemInstruction;
-      let systemText = '';
-
-      if (Array.isArray(systemInstruction)) {
-        systemText = systemInstruction
-          .map((content) => {
-            if (typeof content === 'string') return content;
-            if ('parts' in content) {
-              const contentObj = content as Content;
-              return (
-                contentObj.parts
-                  ?.map((p: Part) =>
-                    typeof p === 'string' ? p : 'text' in p ? p.text : '',
-                  )
-                  .join('\n') || ''
-              );
-            }
-            return '';
-          })
-          .join('\n');
-      } else if (typeof systemInstruction === 'string') {
-        systemText = systemInstruction;
-      } else if (
-        typeof systemInstruction === 'object' &&
-        'parts' in systemInstruction
-      ) {
-        const systemContent = systemInstruction as Content;
-        systemText =
-          systemContent.parts
-            ?.map((p: Part) =>
-              typeof p === 'string' ? p : 'text' in p ? p.text : '',
-            )
-            .join('\n') || '';
-      }
-
-      if (systemText) {
-        messages.push({
-          role: 'system',
-          content: systemText,
-        });
-      }
-    }
-
-    // Handle contents
-    if (Array.isArray(request.contents)) {
-      for (const content of request.contents) {
-        if (typeof content === 'string') {
-          messages.push({ role: 'user', content });
-        } else if ('role' in content && 'parts' in content) {
-          const functionCalls: FunctionCall[] = [];
-          const functionResponses: FunctionResponse[] = [];
-          const textParts: string[] = [];
-
-          for (const part of content.parts || []) {
-            if (typeof part === 'string') {
-              textParts.push(part);
-            } else if ('text' in part && part.text) {
-              textParts.push(part.text);
-            } else if ('functionCall' in part && part.functionCall) {
-              functionCalls.push(part.functionCall);
-            } else if ('functionResponse' in part && part.functionResponse) {
-              functionResponses.push(part.functionResponse);
-            }
-          }
-
-          // Handle function responses (tool results)
-          if (functionResponses.length > 0) {
-            for (const funcResponse of functionResponses) {
-              messages.push({
-                role: 'tool',
-                tool_call_id: funcResponse.id || '',
-                content:
-                  typeof funcResponse.response === 'string'
-                    ? funcResponse.response
-                    : JSON.stringify(funcResponse.response),
-              });
-            }
-          }
-          // Handle model messages with function calls
-          else if (content.role === 'model' && functionCalls.length > 0) {
-            const toolCalls = functionCalls.map((fc, index) => ({
-              id: fc.id || `call_${index}`,
-              type: 'function' as const,
-              function: {
-                name: fc.name || '',
-                arguments: JSON.stringify(fc.args || {}),
-              },
-            }));
-
-            messages.push({
-              role: 'assistant',
-              content: textParts.join('\n') || null,
-              tool_calls: toolCalls,
-            });
-          }
-          // Handle regular text messages
-          else {
-            const role = content.role === 'model' ? 'assistant' : 'user';
-            const text = textParts.join('\n');
-            if (text) {
-              messages.push({ role, content: text });
-            }
-          }
-        }
-      }
-    } else if (request.contents) {
-      if (typeof request.contents === 'string') {
-        messages.push({ role: 'user', content: request.contents });
-      } else if ('role' in request.contents && 'parts' in request.contents) {
-        const content = request.contents;
-        const role = content.role === 'model' ? 'assistant' : 'user';
-        const text =
-          content.parts
-            ?.map((p: Part) =>
-              typeof p === 'string' ? p : 'text' in p ? p.text : '',
-            )
-            .join('\n') || '';
-        messages.push({ role, content: text });
-      }
-    }
-
-    // Clean up orphaned tool calls and merge consecutive assistant messages
-    const cleanedMessages = this.cleanOrphanedToolCallsForLogging(messages);
-    const mergedMessages =
-      this.mergeConsecutiveAssistantMessagesForLogging(cleanedMessages);
-
-    const openaiRequest: OpenAIRequestFormat = {
-      model: this.model,
-      messages: mergedMessages,
-    };
-
-    // Add sampling parameters using the same logic as actual API calls
-    const samplingParams = this.buildSamplingParameters(request);
-    Object.assign(openaiRequest, samplingParams);
-
-    // Convert tools if present
-    if (request.config?.tools) {
-      openaiRequest.tools = await this.convertGeminiToolsToOpenAI(
-        request.config.tools,
-      );
-    }
-
-    return openaiRequest;
-  }
-
-  /**
-   * Clean up orphaned tool calls for logging purposes
-   */
-  private cleanOrphanedToolCallsForLogging(
-    messages: OpenAIMessage[],
-  ): OpenAIMessage[] {
-    const cleaned: OpenAIMessage[] = [];
-    const toolCallIds = new Set<string>();
-    const toolResponseIds = new Set<string>();
-
-    // First pass: collect all tool call IDs and tool response IDs
-    for (const message of messages) {
-      if (message.role === 'assistant' && message.tool_calls) {
-        for (const toolCall of message.tool_calls) {
-          if (toolCall.id) {
-            toolCallIds.add(toolCall.id);
-          }
-        }
-      } else if (message.role === 'tool' && message.tool_call_id) {
-        toolResponseIds.add(message.tool_call_id);
-      }
-    }
-
-    // Second pass: filter out orphaned messages
-    for (const message of messages) {
-      if (message.role === 'assistant' && message.tool_calls) {
-        // Filter out tool calls that don't have corresponding responses
-        const validToolCalls = message.tool_calls.filter(
-          (toolCall) => toolCall.id && toolResponseIds.has(toolCall.id),
-        );
-
-        if (validToolCalls.length > 0) {
-          // Keep the message but only with valid tool calls
-          const cleanedMessage = { ...message };
-          cleanedMessage.tool_calls = validToolCalls;
-          cleaned.push(cleanedMessage);
-        } else if (
-          typeof message.content === 'string' &&
-          message.content.trim()
-        ) {
-          // Keep the message if it has text content, but remove tool calls
-          const cleanedMessage = { ...message };
-          delete cleanedMessage.tool_calls;
-          cleaned.push(cleanedMessage);
-        }
-        // If no valid tool calls and no content, skip the message entirely
-      } else if (message.role === 'tool' && message.tool_call_id) {
-        // Only keep tool responses that have corresponding tool calls
-        if (toolCallIds.has(message.tool_call_id)) {
-          cleaned.push(message);
-        }
-      } else {
-        // Keep all other messages as-is
-        cleaned.push(message);
-      }
-    }
-
-    // Final validation: ensure every assistant message with tool_calls has corresponding tool responses
-    const finalCleaned: OpenAIMessage[] = [];
-    const finalToolCallIds = new Set<string>();
-
-    // Collect all remaining tool call IDs
-    for (const message of cleaned) {
-      if (message.role === 'assistant' && message.tool_calls) {
-        for (const toolCall of message.tool_calls) {
-          if (toolCall.id) {
-            finalToolCallIds.add(toolCall.id);
-          }
-        }
-      }
-    }
-
-    // Verify all tool calls have responses
-    const finalToolResponseIds = new Set<string>();
-    for (const message of cleaned) {
-      if (message.role === 'tool' && message.tool_call_id) {
-        finalToolResponseIds.add(message.tool_call_id);
-      }
-    }
-
-    // Remove any remaining orphaned tool calls
-    for (const message of cleaned) {
-      if (message.role === 'assistant' && message.tool_calls) {
-        const finalValidToolCalls = message.tool_calls.filter(
-          (toolCall) => toolCall.id && finalToolResponseIds.has(toolCall.id),
-        );
-
-        if (finalValidToolCalls.length > 0) {
-          const cleanedMessage = { ...message };
-          cleanedMessage.tool_calls = finalValidToolCalls;
-          finalCleaned.push(cleanedMessage);
-        } else if (
-          typeof message.content === 'string' &&
-          message.content.trim()
-        ) {
-          const cleanedMessage = { ...message };
-          delete cleanedMessage.tool_calls;
-          finalCleaned.push(cleanedMessage);
-        }
-      } else {
-        finalCleaned.push(message);
-      }
-    }
-
-    return finalCleaned;
-  }
-
-  /**
-   * Merge consecutive assistant messages to combine split text and tool calls for logging
-   */
-  private mergeConsecutiveAssistantMessagesForLogging(
-    messages: OpenAIMessage[],
-  ): OpenAIMessage[] {
-    const merged: OpenAIMessage[] = [];
-
-    for (const message of messages) {
-      if (message.role === 'assistant' && merged.length > 0) {
-        const lastMessage = merged[merged.length - 1];
-
-        // If the last message is also an assistant message, merge them
-        if (lastMessage.role === 'assistant') {
-          // Combine content
-          const combinedContent = [
-            lastMessage.content || '',
-            message.content || '',
-          ]
-            .filter(Boolean)
-            .join('');
-
-          // Combine tool calls
-          const combinedToolCalls = [
-            ...(lastMessage.tool_calls || []),
-            ...(message.tool_calls || []),
-          ];
-
-          // Update the last message with combined data
-          lastMessage.content = combinedContent || null;
-          if (combinedToolCalls.length > 0) {
-            lastMessage.tool_calls = combinedToolCalls;
-          }
-
-          continue; // Skip adding the current message since it's been merged
-        }
-      }
-
-      // Add the message as-is if no merging is needed
-      merged.push(message);
-    }
-
-    return merged;
-  }
-
-  /**
    * Convert Gemini response format to OpenAI chat completion format for logging
    */
   private convertGeminiResponseToOpenAI(
@@ -1739,7 +1610,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
         }
       }
 
-      messageContent = textParts.join('');
+      messageContent = textParts.join('').trimEnd();
     }
 
     const choice: OpenAIChoice = {

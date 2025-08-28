@@ -10,9 +10,11 @@ import * as path from 'path';
 import * as os from 'os';
 
 export const EXTENSIONS_DIRECTORY_NAME = path.join('.qwen', 'extensions');
-export const EXTENSIONS_CONFIG_FILENAME = 'gemini-extension.json';
+export const EXTENSIONS_CONFIG_FILENAME = 'qwen-extension.json';
+export const EXTENSIONS_CONFIG_FILENAME_OLD = 'gemini-extension.json';
 
 export interface Extension {
+  path: string;
   config: ExtensionConfig;
   contextFiles: string[];
 }
@@ -67,12 +69,19 @@ function loadExtension(extensionDir: string): Extension | null {
     return null;
   }
 
-  const configFilePath = path.join(extensionDir, EXTENSIONS_CONFIG_FILENAME);
+  let configFilePath = path.join(extensionDir, EXTENSIONS_CONFIG_FILENAME);
   if (!fs.existsSync(configFilePath)) {
-    console.error(
-      `Warning: extension directory ${extensionDir} does not contain a config file ${configFilePath}.`,
+    const oldConfigFilePath = path.join(
+      extensionDir,
+      EXTENSIONS_CONFIG_FILENAME_OLD,
     );
-    return null;
+    if (!fs.existsSync(oldConfigFilePath)) {
+      console.error(
+        `Warning: extension directory ${extensionDir} does not contain a config file ${configFilePath}.`,
+      );
+      return null;
+    }
+    configFilePath = oldConfigFilePath;
   }
 
   try {
@@ -90,6 +99,7 @@ function loadExtension(extensionDir: string): Extension | null {
       .filter((contextFilePath) => fs.existsSync(contextFilePath));
 
     return {
+      path: extensionDir,
       config,
       contextFiles,
     };
@@ -121,6 +131,7 @@ export function annotateActiveExtensions(
       name: extension.config.name,
       version: extension.config.version,
       isActive: true,
+      path: extension.path,
     }));
   }
 
@@ -136,6 +147,7 @@ export function annotateActiveExtensions(
       name: extension.config.name,
       version: extension.config.version,
       isActive: false,
+      path: extension.path,
     }));
   }
 
@@ -153,6 +165,7 @@ export function annotateActiveExtensions(
       name: extension.config.name,
       version: extension.config.version,
       isActive,
+      path: extension.path,
     });
   }
 

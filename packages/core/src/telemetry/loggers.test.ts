@@ -5,6 +5,7 @@
  */
 
 import {
+  AnyToolInvocation,
   AuthType,
   CompletedToolCall,
   ContentGeneratorConfig,
@@ -12,6 +13,7 @@ import {
   ErroredToolCall,
   GeminiClient,
   ToolConfirmationOutcome,
+  ToolErrorType,
   ToolRegistry,
 } from '../index.js';
 import { logs } from '@opentelemetry/api-logs';
@@ -33,11 +35,11 @@ import {
   logToolCall,
   logFlashFallback,
 } from './loggers.js';
+import { ToolCallDecision } from './tool-call-decision.js';
 import {
   ApiRequestEvent,
   ApiResponseEvent,
   StartSessionEvent,
-  ToolCallDecision,
   ToolCallEvent,
   UserPromptEvent,
   FlashFallbackEvent,
@@ -211,6 +213,7 @@ describe('loggers', () => {
         toolUsePromptTokenCount: 2,
       };
       const event = new ApiResponseEvent(
+        'test-response-id',
         'test-model',
         100,
         'prompt-id-1',
@@ -228,6 +231,7 @@ describe('loggers', () => {
           'event.name': EVENT_API_RESPONSE,
           'event.timestamp': '2025-01-01T00:00:00.000Z',
           [SemanticAttributes.HTTP_STATUS_CODE]: 200,
+          response_id: 'test-response-id',
           model: 'test-model',
           status_code: 200,
           duration_ms: 100,
@@ -274,6 +278,7 @@ describe('loggers', () => {
         toolUsePromptTokenCount: 2,
       };
       const event = new ApiResponseEvent(
+        'test-response-id-2',
         'test-model',
         100,
         'prompt-id-1',
@@ -431,6 +436,7 @@ describe('loggers', () => {
     });
 
     it('should log a tool call with all fields', () => {
+      const tool = new EditTool(mockConfig);
       const call: CompletedToolCall = {
         status: 'success',
         request: {
@@ -448,8 +454,10 @@ describe('loggers', () => {
           responseParts: 'test-response',
           resultDisplay: undefined,
           error: undefined,
+          errorType: undefined,
         },
-        tool: new EditTool(mockConfig),
+        tool,
+        invocation: {} as AnyToolInvocation,
         durationMs: 100,
         outcome: ToolConfirmationOutcome.ProceedOnce,
       };
@@ -511,6 +519,7 @@ describe('loggers', () => {
           responseParts: 'test-response',
           resultDisplay: undefined,
           error: undefined,
+          errorType: undefined,
         },
         durationMs: 100,
         outcome: ToolConfirmationOutcome.Cancel,
@@ -574,9 +583,11 @@ describe('loggers', () => {
           responseParts: 'test-response',
           resultDisplay: undefined,
           error: undefined,
+          errorType: undefined,
         },
         outcome: ToolConfirmationOutcome.ModifyWithEditor,
         tool: new EditTool(mockConfig),
+        invocation: {} as AnyToolInvocation,
         durationMs: 100,
       };
       const event = new ToolCallEvent(call);
@@ -638,8 +649,10 @@ describe('loggers', () => {
           responseParts: 'test-response',
           resultDisplay: undefined,
           error: undefined,
+          errorType: undefined,
         },
         tool: new EditTool(mockConfig),
+        invocation: {} as AnyToolInvocation,
         durationMs: 100,
       };
       const event = new ToolCallEvent(call);
@@ -703,6 +716,7 @@ describe('loggers', () => {
             name: 'test-error-type',
             message: 'test-error',
           },
+          errorType: ToolErrorType.UNKNOWN,
         },
         durationMs: 100,
       };
@@ -729,8 +743,8 @@ describe('loggers', () => {
           success: false,
           error: 'test-error',
           'error.message': 'test-error',
-          error_type: 'test-error-type',
-          'error.type': 'test-error-type',
+          error_type: ToolErrorType.UNKNOWN,
+          'error.type': ToolErrorType.UNKNOWN,
           prompt_id: 'prompt-id-5',
         },
       });

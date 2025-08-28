@@ -7,7 +7,7 @@
 import * as http from 'node:http';
 import * as crypto from 'node:crypto';
 import { URL } from 'node:url';
-import open from 'open';
+import { openBrowserSecurely } from '../utils/secure-browser-launcher.js';
 import { MCPOAuthToken, MCPOAuthTokenStorage } from './oauth-token-storage.js';
 import { getErrorMessage } from '../utils/errors.js';
 import { OAuthUtils } from './oauth-utils.js';
@@ -22,6 +22,7 @@ export interface MCPOAuthConfig {
   authorizationUrl?: string;
   tokenUrl?: string;
   scopes?: string[];
+  audiences?: string[];
   redirectUri?: string;
   tokenParamName?: string; // For SSE connections, specifies the query parameter name for the token
 }
@@ -90,7 +91,6 @@ export class MCPOAuthProvider {
   private static readonly REDIRECT_PORT = 7777;
   private static readonly REDIRECT_PATH = '/oauth/callback';
   private static readonly HTTP_OK = 200;
-  private static readonly HTTP_REDIRECT = 302;
 
   /**
    * Register a client dynamically with the OAuth server.
@@ -297,6 +297,10 @@ export class MCPOAuthProvider {
       params.append('scope', config.scopes.join(' '));
     }
 
+    if (config.audiences && config.audiences.length > 0) {
+      params.append('audience', config.audiences.join(' '));
+    }
+
     // Add resource parameter for MCP OAuth spec compliance
     // Use the MCP server URL if provided, otherwise fall back to authorization URL
     const resourceUrl = mcpServerUrl || config.authorizationUrl!;
@@ -308,7 +312,11 @@ export class MCPOAuthProvider {
       );
     }
 
-    return `${config.authorizationUrl}?${params.toString()}`;
+    const url = new URL(config.authorizationUrl!);
+    params.forEach((value, key) => {
+      url.searchParams.append(key, value);
+    });
+    return url.toString();
   }
 
   /**
@@ -340,6 +348,10 @@ export class MCPOAuthProvider {
 
     if (config.clientSecret) {
       params.append('client_secret', config.clientSecret);
+    }
+
+    if (config.audiences && config.audiences.length > 0) {
+      params.append('audience', config.audiences.join(' '));
     }
 
     // Add resource parameter for MCP OAuth spec compliance
@@ -398,6 +410,10 @@ export class MCPOAuthProvider {
 
     if (config.scopes && config.scopes.length > 0) {
       params.append('scope', config.scopes.join(' '));
+    }
+
+    if (config.audiences && config.audiences.length > 0) {
+      params.append('audience', config.audiences.join(' '));
     }
 
     // Add resource parameter for MCP OAuth spec compliance
@@ -593,9 +609,9 @@ export class MCPOAuthProvider {
     // Start callback server
     const callbackPromise = this.startCallbackServer(pkceParams.state);
 
-    // Open browser
+    // Open browser securely
     try {
-      await open(authUrl);
+      await openBrowserSecurely(authUrl);
     } catch (error) {
       console.warn(
         'Failed to open browser automatically:',

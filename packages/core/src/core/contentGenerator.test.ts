@@ -9,19 +9,23 @@ import {
   createContentGenerator,
   AuthType,
   createContentGeneratorConfig,
+  ContentGenerator,
 } from './contentGenerator.js';
 import { createCodeAssistContentGenerator } from '../code_assist/codeAssist.js';
 import { GoogleGenAI } from '@google/genai';
 import { Config } from '../config/config.js';
+import { LoggingContentGenerator } from './loggingContentGenerator.js';
 
 vi.mock('../code_assist/codeAssist.js');
 vi.mock('@google/genai');
 
-const mockConfig = {} as unknown as Config;
+const mockConfig = {
+  getCliVersion: vi.fn().mockReturnValue('1.0.0'),
+} as unknown as Config;
 
 describe('createContentGenerator', () => {
   it('should create a CodeAssistContentGenerator', async () => {
-    const mockGenerator = {} as unknown;
+    const mockGenerator = {} as unknown as ContentGenerator;
     vi.mocked(createCodeAssistContentGenerator).mockResolvedValue(
       mockGenerator as never,
     );
@@ -33,13 +37,15 @@ describe('createContentGenerator', () => {
       mockConfig,
     );
     expect(createCodeAssistContentGenerator).toHaveBeenCalled();
-    expect(generator).toBe(mockGenerator);
+    expect(generator).toEqual(
+      new LoggingContentGenerator(mockGenerator, mockConfig),
+    );
   });
 
   it('should create a GoogleGenAI content generator', async () => {
     const mockGenerator = {
       models: {},
-    } as unknown;
+    } as unknown as GoogleGenAI;
     vi.mocked(GoogleGenAI).mockImplementation(() => mockGenerator as never);
     const generator = await createContentGenerator(
       {
@@ -58,7 +64,12 @@ describe('createContentGenerator', () => {
         },
       },
     });
-    expect(generator).toBe((mockGenerator as GoogleGenAI).models);
+    expect(generator).toEqual(
+      new LoggingContentGenerator(
+        (mockGenerator as GoogleGenAI).models,
+        mockConfig,
+      ),
+    );
   });
 });
 
@@ -73,6 +84,8 @@ describe('createContentGeneratorConfig', () => {
     getSamplingParams: vi.fn().mockReturnValue(undefined),
     getContentGeneratorTimeout: vi.fn().mockReturnValue(undefined),
     getContentGeneratorMaxRetries: vi.fn().mockReturnValue(undefined),
+    getContentGeneratorSamplingParams: vi.fn().mockReturnValue(undefined),
+    getCliVersion: vi.fn().mockReturnValue('1.0.0'),
   } as unknown as Config;
 
   beforeEach(() => {

@@ -4,57 +4,57 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
-import { useInput } from 'ink';
-import {
-  Config,
-  GeminiClient,
-  GeminiEventType as ServerGeminiEventType,
-  ServerGeminiStreamEvent as GeminiEvent,
-  ServerGeminiContentEvent as ContentEvent,
-  ServerGeminiErrorEvent as ErrorEvent,
-  ServerGeminiChatCompressedEvent,
-  ServerGeminiFinishedEvent,
-  getErrorMessage,
-  isNodeError,
-  MessageSenderType,
-  ToolCallRequestInfo,
-  logUserPrompt,
-  GitService,
-  EditorType,
-  ThoughtSummary,
-  UnauthorizedError,
-  UserPromptEvent,
-  DEFAULT_GEMINI_FLASH_MODEL,
-} from '@qwen-code/qwen-code-core';
 import { type Part, type PartListUnion, FinishReason } from '@google/genai';
 import {
-  StreamingState,
+  Config,
+  ServerGeminiContentEvent as ContentEvent,
+  DEFAULT_GEMINI_FLASH_MODEL,
+  EditorType,
+  ServerGeminiErrorEvent as ErrorEvent,
+  GeminiClient,
+  ServerGeminiStreamEvent as GeminiEvent,
+  getErrorMessage,
+  GitService,
+  isNodeError,
+  logUserPrompt,
+  MessageSenderType,
+  parseAndFormatApiError,
+  ServerGeminiChatCompressedEvent,
+  GeminiEventType as ServerGeminiEventType,
+  ServerGeminiFinishedEvent,
+  ThoughtSummary,
+  ToolCallRequestInfo,
+  UnauthorizedError,
+  UserPromptEvent,
+} from '@qwen-code/qwen-code-core';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSessionStats } from '../contexts/SessionContext.js';
+import {
   HistoryItem,
-  HistoryItemWithoutId,
   HistoryItemToolGroup,
+  HistoryItemWithoutId,
   MessageType,
   SlashCommandProcessorResult,
+  StreamingState,
   ToolCallStatus,
 } from '../types.js';
 import { isAtCommand } from '../utils/commandUtils.js';
-import { parseAndFormatApiError } from '../utils/errorParsing.js';
-import { useShellCommandProcessor } from './shellCommandProcessor.js';
-import { handleAtCommand } from './atCommandProcessor.js';
 import { findLastSafeSplitPoint } from '../utils/markdownUtilities.js';
-import { useStateAndRef } from './useStateAndRef.js';
+import { handleAtCommand } from './atCommandProcessor.js';
+import { useShellCommandProcessor } from './shellCommandProcessor.js';
 import { UseHistoryManagerReturn } from './useHistoryManager.js';
+import { useKeypress } from './useKeypress.js';
 import { useLogger } from './useLogger.js';
-import { promises as fs } from 'fs';
-import path from 'path';
 import {
-  useReactToolScheduler,
   mapToDisplay as mapTrackedToolCallsToDisplay,
-  TrackedToolCall,
-  TrackedCompletedToolCall,
   TrackedCancelledToolCall,
+  TrackedCompletedToolCall,
+  TrackedToolCall,
+  useReactToolScheduler,
 } from './useReactToolScheduler.js';
-import { useSessionStats } from '../contexts/SessionContext.js';
+import { useStateAndRef } from './useStateAndRef.js';
 
 export function mergePartListUnions(list: PartListUnion[]): PartListUnion {
   const resultParts: PartListUnion = [];
@@ -82,7 +82,6 @@ export const useGeminiStream = (
   geminiClient: GeminiClient,
   history: HistoryItem[],
   addItem: UseHistoryManagerReturn['addItem'],
-  setShowHelp: React.Dispatch<React.SetStateAction<boolean>>,
   config: Config,
   onDebugMessage: (message: string) => void,
   handleSlashCommand: (
@@ -94,10 +93,13 @@ export const useGeminiStream = (
   performMemoryRefresh: () => Promise<void>,
   modelSwitchedFromQuotaError: boolean,
   setModelSwitchedFromQuotaError: React.Dispatch<React.SetStateAction<boolean>>,
+  onEditorClose: () => void,
+  onCancelSubmit: () => void,
 ) => {
   const [initError, setInitError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const turnCancelledRef = useRef(false);
+  const isSubmittingQueryRef = useRef(false);
   const [isResponding, setIsResponding] = useState<boolean>(false);
   const [thought, setThought] = useState<ThoughtSummary | null>(null);
   const [pendingHistoryItemRef, setPendingHistoryItem] =
@@ -134,6 +136,7 @@ export const useGeminiStream = (
       config,
       setPendingHistoryItem,
       getPreferredEditor,
+      onEditorClose,
     );
 
   const pendingToolCallGroupDisplay = useMemo(
@@ -181,27 +184,45 @@ export const useGeminiStream = (
     return StreamingState.Idle;
   }, [isResponding, toolCalls]);
 
-  useInput((_input, key) => {
-    if (streamingState === StreamingState.Responding && key.escape) {
-      if (turnCancelledRef.current) {
-        return;
-      }
-      turnCancelledRef.current = true;
-      abortControllerRef.current?.abort();
-      if (pendingHistoryItemRef.current) {
-        addItem(pendingHistoryItemRef.current, Date.now());
-      }
-      addItem(
-        {
-          type: MessageType.INFO,
-          text: 'Request cancelled.',
-        },
-        Date.now(),
-      );
-      setPendingHistoryItem(null);
-      setIsResponding(false);
+  const cancelOngoingRequest = useCallback(() => {
+    if (streamingState !== StreamingState.Responding) {
+      return;
     }
-  });
+    if (turnCancelledRef.current) {
+      return;
+    }
+    turnCancelledRef.current = true;
+    isSubmittingQueryRef.current = false;
+    abortControllerRef.current?.abort();
+    if (pendingHistoryItemRef.current) {
+      addItem(pendingHistoryItemRef.current, Date.now());
+    }
+    addItem(
+      {
+        type: MessageType.INFO,
+        text: 'Request cancelled.',
+      },
+      Date.now(),
+    );
+    setPendingHistoryItem(null);
+    onCancelSubmit();
+    setIsResponding(false);
+  }, [
+    streamingState,
+    addItem,
+    setPendingHistoryItem,
+    onCancelSubmit,
+    pendingHistoryItemRef,
+  ]);
+
+  useKeypress(
+    (key) => {
+      if (key.name === 'escape') {
+        cancelOngoingRequest();
+      }
+    },
+    { isActive: streamingState === StreamingState.Responding },
+  );
 
   const prepareQueryForGemini = useCallback(
     async (
@@ -414,8 +435,9 @@ export const useGeminiStream = (
         userMessageTimestamp,
       );
       setIsResponding(false);
+      setThought(null); // Reset thought when user cancels
     },
-    [addItem, pendingHistoryItemRef, setPendingHistoryItem],
+    [addItem, pendingHistoryItemRef, setPendingHistoryItem, setThought],
   );
 
   const handleErrorEvent = useCallback(
@@ -437,8 +459,9 @@ export const useGeminiStream = (
         },
         userMessageTimestamp,
       );
+      setThought(null); // Reset thought when there's an error
     },
-    [addItem, pendingHistoryItemRef, setPendingHistoryItem, config],
+    [addItem, pendingHistoryItemRef, setPendingHistoryItem, config, setThought],
   );
 
   const handleFinishedEvent = useCallback(
@@ -621,6 +644,12 @@ export const useGeminiStream = (
       options?: { isContinuation: boolean },
       prompt_id?: string,
     ) => {
+      // Prevent concurrent executions of submitQuery, but allow continuations
+      // which are part of the same logical flow (tool responses)
+      if (isSubmittingQueryRef.current && !options?.isContinuation) {
+        return;
+      }
+
       if (
         (streamingState === StreamingState.Responding ||
           streamingState === StreamingState.WaitingForConfirmation) &&
@@ -628,8 +657,10 @@ export const useGeminiStream = (
       )
         return;
 
+      // Set the flag to indicate we're now executing
+      isSubmittingQueryRef.current = true;
+
       const userMessageTimestamp = Date.now();
-      setShowHelp(false);
 
       // Reset quota error flag when starting a new query (not a continuation)
       if (!options?.isContinuation) {
@@ -653,11 +684,13 @@ export const useGeminiStream = (
       );
 
       if (!shouldProceed || queryToSend === null) {
+        isSubmittingQueryRef.current = false;
         return;
       }
 
       if (!options?.isContinuation) {
         startNewPrompt();
+        setThought(null); // Reset thought when starting a new prompt
       }
 
       setIsResponding(true);
@@ -676,6 +709,7 @@ export const useGeminiStream = (
         );
 
         if (processingStatus === StreamProcessingStatus.UserCancelled) {
+          isSubmittingQueryRef.current = false;
           return;
         }
 
@@ -707,11 +741,11 @@ export const useGeminiStream = (
         }
       } finally {
         setIsResponding(false);
+        isSubmittingQueryRef.current = false;
       }
     },
     [
       streamingState,
-      setShowHelp,
       setModelSwitchedFromQuotaError,
       prepareQueryForGemini,
       processGeminiStreamEvents,
@@ -971,5 +1005,6 @@ export const useGeminiStream = (
     initError,
     pendingHistoryItems,
     thought,
+    cancelOngoingRequest,
   };
 };

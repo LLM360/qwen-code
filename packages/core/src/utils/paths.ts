@@ -8,10 +8,17 @@ import path from 'node:path';
 import os from 'os';
 import * as crypto from 'crypto';
 
-export const GEMINI_DIR = '.qwen';
+export const QWEN_DIR = '.qwen';
 export const GOOGLE_ACCOUNTS_FILENAME = 'google_accounts.json';
 const TMP_DIR_NAME = 'tmp';
 const COMMANDS_DIR_NAME = 'commands';
+
+/**
+ * Special characters that need to be escaped in file paths for shell compatibility.
+ * Includes: spaces, parentheses, brackets, braces, semicolons, ampersands, pipes,
+ * asterisks, question marks, dollar signs, backticks, quotes, hash, and other shell metacharacters.
+ */
+export const SHELL_SPECIAL_CHARS = /[ \t()[\]{};|*?$`'"#&<>!~]/;
 
 /**
  * Replaces the home directory with a tilde.
@@ -119,26 +126,43 @@ export function makeRelative(
 }
 
 /**
- * Escapes spaces in a file path.
+ * Escapes special characters in a file path like macOS terminal does.
+ * Escapes: spaces, parentheses, brackets, braces, semicolons, ampersands, pipes,
+ * asterisks, question marks, dollar signs, backticks, quotes, hash, and other shell metacharacters.
  */
 export function escapePath(filePath: string): string {
   let result = '';
   for (let i = 0; i < filePath.length; i++) {
-    // Only escape spaces that are not already escaped.
-    if (filePath[i] === ' ' && (i === 0 || filePath[i - 1] !== '\\')) {
-      result += '\\ ';
+    const char = filePath[i];
+
+    // Count consecutive backslashes before this character
+    let backslashCount = 0;
+    for (let j = i - 1; j >= 0 && filePath[j] === '\\'; j--) {
+      backslashCount++;
+    }
+
+    // Character is already escaped if there's an odd number of backslashes before it
+    const isAlreadyEscaped = backslashCount % 2 === 1;
+
+    // Only escape if not already escaped
+    if (!isAlreadyEscaped && SHELL_SPECIAL_CHARS.test(char)) {
+      result += '\\' + char;
     } else {
-      result += filePath[i];
+      result += char;
     }
   }
   return result;
 }
 
 /**
- * Unescapes spaces in a file path.
+ * Unescapes special characters in a file path.
+ * Removes backslash escaping from shell metacharacters.
  */
 export function unescapePath(filePath: string): string {
-  return filePath.replace(/\\ /g, ' ');
+  return filePath.replace(
+    new RegExp(`\\\\([${SHELL_SPECIAL_CHARS.source.slice(1, -1)}])`, 'g'),
+    '$1',
+  );
 }
 
 /**
@@ -157,7 +181,7 @@ export function getProjectHash(projectRoot: string): string {
  */
 export function getProjectTempDir(projectRoot: string): string {
   const hash = getProjectHash(projectRoot);
-  return path.join(os.homedir(), GEMINI_DIR, TMP_DIR_NAME, hash);
+  return path.join(os.homedir(), QWEN_DIR, TMP_DIR_NAME, hash);
 }
 
 /**
@@ -165,7 +189,7 @@ export function getProjectTempDir(projectRoot: string): string {
  * @returns The path to the user's commands directory.
  */
 export function getUserCommandsDir(): string {
-  return path.join(os.homedir(), GEMINI_DIR, COMMANDS_DIR_NAME);
+  return path.join(os.homedir(), QWEN_DIR, COMMANDS_DIR_NAME);
 }
 
 /**
@@ -174,5 +198,5 @@ export function getUserCommandsDir(): string {
  * @returns The path to the project's commands directory.
  */
 export function getProjectCommandsDir(projectRoot: string): string {
-  return path.join(projectRoot, GEMINI_DIR, COMMANDS_DIR_NAME);
+  return path.join(projectRoot, QWEN_DIR, COMMANDS_DIR_NAME);
 }

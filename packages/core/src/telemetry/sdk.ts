@@ -28,7 +28,6 @@ import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
 import { Config } from '../config/config.js';
 import { SERVICE_NAME } from './constants.js';
 import { initializeMetrics } from './metrics.js';
-import { ClearcutLogger } from './clearcut-logger/clearcut-logger.js';
 import {
   FileLogExporter,
   FileMetricExporter,
@@ -125,25 +124,32 @@ export function initializeTelemetry(config: Config): void {
 
   try {
     sdk.start();
-    console.log('OpenTelemetry SDK started successfully.');
+    if (config.getDebugMode()) {
+      console.log('OpenTelemetry SDK started successfully.');
+    }
     telemetryInitialized = true;
     initializeMetrics(config);
   } catch (error) {
     console.error('Error starting OpenTelemetry SDK:', error);
   }
 
-  process.on('SIGTERM', shutdownTelemetry);
-  process.on('SIGINT', shutdownTelemetry);
+  process.on('SIGTERM', () => {
+    shutdownTelemetry(config);
+  });
+  process.on('SIGINT', () => {
+    shutdownTelemetry(config);
+  });
 }
 
-export async function shutdownTelemetry(): Promise<void> {
+export async function shutdownTelemetry(config: Config): Promise<void> {
   if (!telemetryInitialized || !sdk) {
     return;
   }
   try {
-    ClearcutLogger.getInstance()?.shutdown();
     await sdk.shutdown();
-    console.log('OpenTelemetry SDK shut down successfully.');
+    if (config.getDebugMode()) {
+      console.log('OpenTelemetry SDK shut down successfully.');
+    }
   } catch (error) {
     console.error('Error shutting down SDK:', error);
   } finally {
