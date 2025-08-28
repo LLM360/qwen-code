@@ -26,8 +26,6 @@ export async function runNonInteractive(
   input: string,
   prompt_id: string,
 ): Promise<void> {
-  await config.initialize();
-  
   const workDir = process.cwd();
   const allMessages: Content[] = [];
   
