@@ -23,8 +23,14 @@ import { useAuthCommand } from './hooks/useAuthCommand.js';
 import { useQwenAuth } from './hooks/useQwenAuth.js';
 import { useFolderTrust } from './hooks/useFolderTrust.js';
 import { useEditorSettings } from './hooks/useEditorSettings.js';
+import { useQuitConfirmation } from './hooks/useQuitConfirmation.js';
+import { useWelcomeBack } from './hooks/useWelcomeBack.js';
+import { useDialogClose } from './hooks/useDialogClose.js';
 import { useSlashCommandProcessor } from './hooks/slashCommandProcessor.js';
+import { useSubagentCreateDialog } from './hooks/useSubagentCreateDialog.js';
+import { useAgentsManagerDialog } from './hooks/useAgentsManagerDialog.js';
 import { useAutoAcceptIndicator } from './hooks/useAutoAcceptIndicator.js';
+import { useMessageQueue } from './hooks/useMessageQueue.js';
 import { useConsoleMessages } from './hooks/useConsoleMessages.js';
 import { Header } from './components/Header.js';
 import { LoadingIndicator } from './components/LoadingIndicator.js';
@@ -39,7 +45,12 @@ import { QwenOAuthProgress } from './components/QwenOAuthProgress.js';
 import { EditorSettingsDialog } from './components/EditorSettingsDialog.js';
 import { FolderTrustDialog } from './components/FolderTrustDialog.js';
 import { ShellConfirmationDialog } from './components/ShellConfirmationDialog.js';
+import { QuitConfirmationDialog } from './components/QuitConfirmationDialog.js';
 import { RadioButtonSelect } from './components/shared/RadioButtonSelect.js';
+import {
+  AgentCreationWizard,
+  AgentsManagerDialog,
+} from './components/subagents/index.js';
 import { Colors } from './colors.js';
 import { loadHierarchicalGeminiMemory } from '../config/config.js';
 import { LoadedSettings, SettingScope } from '../config/settings.js';
@@ -82,6 +93,7 @@ import { useTextBuffer } from './components/shared/text-buffer.js';
 import { useVimMode, VimModeProvider } from './contexts/VimModeContext.js';
 import { useVim } from './hooks/vim.js';
 import { useKeypress, Key } from './hooks/useKeypress.js';
+import { KeypressProvider } from './contexts/KeypressContext.js';
 import { useKittyKeyboardProtocol } from './hooks/useKittyKeyboardProtocol.js';
 import { keyMatchers, Command } from './keyMatchers.js';
 import * as fs from 'fs';
@@ -101,8 +113,10 @@ import { SettingsDialog } from './components/SettingsDialog.js';
 import { setUpdateHandler } from '../utils/handleAutoUpdate.js';
 import { appEvents, AppEvent } from '../utils/events.js';
 import { isNarrowWidth } from './utils/isNarrowWidth.js';
+import { WelcomeBackDialog } from './components/WelcomeBackDialog.js';
 
-const CTRL_EXIT_PROMPT_DURATION_MS = 1000;
+// Maximum number of queued messages to display in UI to prevent performance issues
+const MAX_DISPLAYED_QUEUED_MESSAGES = 3;
 
 interface AppProps {
   config: Config;
@@ -111,13 +125,21 @@ interface AppProps {
   version: string;
 }
 
-export const AppWrapper = (props: AppProps) => (
-  <SessionStatsProvider>
-    <VimModeProvider settings={props.settings}>
-      <App {...props} />
-    </VimModeProvider>
-  </SessionStatsProvider>
-);
+export const AppWrapper = (props: AppProps) => {
+  const kittyProtocolStatus = useKittyKeyboardProtocol();
+  return (
+    <KeypressProvider
+      kittyProtocolEnabled={kittyProtocolStatus.enabled}
+      config={props.config}
+    >
+      <SessionStatsProvider>
+        <VimModeProvider settings={props.settings}>
+          <App {...props} />
+        </VimModeProvider>
+      </SessionStatsProvider>
+    </KeypressProvider>
+  );
+};
 
 const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
   const isFocused = useFocus();
@@ -173,6 +195,9 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
   const [editorError, setEditorError] = useState<string | null>(null);
   const [footerHeight, setFooterHeight] = useState<number>(0);
   const [corgiMode, setCorgiMode] = useState(false);
+  const [isTrustedFolderState, setIsTrustedFolder] = useState(
+    config.isTrustedFolder(),
+  );
   const [currentModel, setCurrentModel] = useState(config.getModel());
   const [shellModeActive, setShellModeActive] = useState(false);
   const [showErrorDetails, setShowErrorDetails] = useState<boolean>(false);
@@ -254,10 +279,25 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
   const { isSettingsDialogOpen, openSettingsDialog, closeSettingsDialog } =
     useSettingsCommand();
 
+  const {
+    isSubagentCreateDialogOpen,
+    openSubagentCreateDialog,
+    closeSubagentCreateDialog,
+  } = useSubagentCreateDialog();
+
+  const {
+    isAgentsManagerDialogOpen,
+    openAgentsManagerDialog,
+    closeAgentsManagerDialog,
+  } = useAgentsManagerDialog();
+
   const { isFolderTrustDialogOpen, handleFolderTrustSelect } = useFolderTrust(
     settings,
-    config,
+    setIsTrustedFolder,
   );
+
+  const { showQuitConfirmation, handleQuitConfirmationSelect } =
+    useQuitConfirmation();
 
   const {
     isAuthDialogOpen,
@@ -535,6 +575,7 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
     commandContext,
     shellConfirmationRequest,
     confirmationRequest,
+    quitConfirmationRequest,
   } = useSlashCommandProcessor(
     config,
     settings,
@@ -550,9 +591,12 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
     setQuittingMessages,
     openPrivacyNotice,
     openSettingsDialog,
+    openSubagentCreateDialog,
+    openAgentsManagerDialog,
     toggleVimEnabled,
     setIsProcessing,
     setGeminiMdFileCount,
+    showQuitConfirmation,
   );
 
   const buffer = useTextBuffer({
@@ -566,12 +610,8 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
 
   const [userMessages, setUserMessages] = useState<string[]>([]);
 
-  const handleUserCancel = useCallback(() => {
-    const lastUserMessage = userMessages.at(-1);
-    if (lastUserMessage) {
-      buffer.setText(lastUserMessage);
-    }
-  }, [buffer, userMessages]);
+  // Stable reference for cancel handler to avoid circular dependency
+  const cancelHandlerRef = useRef<() => void>(() => {});
 
   const {
     streamingState,
@@ -594,18 +634,67 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
     modelSwitchedFromQuotaError,
     setModelSwitchedFromQuotaError,
     refreshStatic,
-    handleUserCancel,
+    () => cancelHandlerRef.current(),
   );
 
-  // Input handling
+  // Welcome back functionality
+  const {
+    welcomeBackInfo,
+    showWelcomeBackDialog,
+    welcomeBackChoice,
+    handleWelcomeBackSelection,
+    handleWelcomeBackClose,
+  } = useWelcomeBack(config, submitQuery, buffer, settings.merged);
+
+  // Dialog close functionality
+  const { closeAnyOpenDialog } = useDialogClose({
+    isThemeDialogOpen,
+    handleThemeSelect,
+    isAuthDialogOpen,
+    handleAuthSelect,
+    selectedAuthType: settings.merged.selectedAuthType,
+    isEditorDialogOpen,
+    exitEditorDialog,
+    isSettingsDialogOpen,
+    closeSettingsDialog,
+    isFolderTrustDialogOpen,
+    showPrivacyNotice,
+    setShowPrivacyNotice,
+    showWelcomeBackDialog,
+    handleWelcomeBackClose,
+    quitConfirmationRequest,
+  });
+
+  // Message queue for handling input during streaming
+  const { messageQueue, addMessage, clearQueue, getQueuedMessagesText } =
+    useMessageQueue({
+      streamingState,
+      submitQuery,
+    });
+
+  // Update the cancel handler with message queue support
+  cancelHandlerRef.current = useCallback(() => {
+    const lastUserMessage = userMessages.at(-1);
+    let textToSet = lastUserMessage || '';
+
+    // Append queued messages if any exist
+    const queuedText = getQueuedMessagesText();
+    if (queuedText) {
+      textToSet = textToSet ? `${textToSet}\n\n${queuedText}` : queuedText;
+      clearQueue();
+    }
+
+    if (textToSet) {
+      buffer.setText(textToSet);
+    }
+  }, [buffer, userMessages, getQueuedMessagesText, clearQueue]);
+
+  // Input handling - queue messages for processing
   const handleFinalSubmit = useCallback(
     (submittedValue: string) => {
-      const trimmedValue = submittedValue.trim();
-      if (trimmedValue.length > 0) {
-        submitQuery(trimmedValue);
-      }
+      addMessage(submittedValue);
     },
-    [submitQuery],
+    [addMessage],
   );
 
   const handleIdePromptComplete = useCallback(
@@ -640,29 +729,59 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
   const { elapsedTime, currentLoadingPhrase } =
     useLoadingIndicator(streamingState);
   const showAutoAcceptIndicator = useAutoAcceptIndicator({ config });
-  const kittyProtocolStatus = useKittyKeyboardProtocol();
 
   const handleExit = useCallback(
     (
       pressedOnce: boolean,
       setPressedOnce: (value: boolean) => void,
-      timerRef: React.MutableRefObject<NodeJS.Timeout | null>,
+      timerRef: ReturnType<typeof useRef<NodeJS.Timeout | null>>,
     ) => {
+      // Fast double-press: Direct quit (preserve user habit)
       if (pressedOnce) {
         if (timerRef.current) {
           clearTimeout(timerRef.current);
         }
-        // Directly invoke the central command handler.
+        // Exit directly without showing confirmation dialog
         handleSlashCommand('/quit');
-      } else {
-        setPressedOnce(true);
-        timerRef.current = setTimeout(() => {
-          setPressedOnce(false);
-          timerRef.current = null;
-        }, CTRL_EXIT_PROMPT_DURATION_MS);
+        return;
       }
+
+      // First press: Prioritize cleanup tasks
+
+      // Special case: If quit-confirm dialog is open, Ctrl+C means "quit immediately"
+      if (quitConfirmationRequest) {
+        handleSlashCommand('/quit');
+        return;
+      }
+
+      // 1. Close other dialogs (highest priority)
+      if (closeAnyOpenDialog()) {
+        return; // Dialog closed, end processing
+      }
+
+      // 2. Cancel ongoing requests
+      if (streamingState === StreamingState.Responding) {
+        cancelOngoingRequest?.();
+        return; // Request cancelled, end processing
+      }
+
+      // 3. Clear input buffer (if has content)
+      if (buffer.text.length > 0) {
+        buffer.setText('');
+        return; // Input cleared, end processing
+      }
+
+      // All cleanup tasks completed, show quit confirmation dialog
+      handleSlashCommand('/quit-confirm');
     },
-    [handleSlashCommand],
+    [
+      handleSlashCommand,
+      quitConfirmationRequest,
+      closeAnyOpenDialog,
+      streamingState,
+      cancelOngoingRequest,
+      buffer,
+    ],
   );
 
   const handleGlobalKeypress = useCallback(
@@ -695,9 +814,6 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
         if (isAuthenticating) {
           return;
         }
-        if (!ctrlCPressedOnce) {
-          cancelOngoingRequest?.();
-        }
         handleExit(ctrlCPressedOnce, setCtrlCPressedOnce, ctrlCTimerRef);
       } else if (keyMatchers[Command.EXIT](key)) {
         if (buffer.text.length > 0) {
@@ -729,14 +845,11 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
       ctrlDTimerRef,
       handleSlashCommand,
       isAuthenticating,
-      cancelOngoingRequest,
     ],
   );
 
   useKeypress(handleGlobalKeypress, {
     isActive: true,
-    kittyProtocolEnabled: kittyProtocolStatus.enabled,
-    config,
   });
 
   useEffect(() => {
@@ -784,7 +897,11 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
   }, [history, logger]);
 
   const isInputActive =
-    streamingState === StreamingState.Idle && !initError && !isProcessing;
+    (streamingState === StreamingState.Idle ||
+      streamingState === StreamingState.Responding) &&
+    !initError &&
+    !isProcessing &&
+    !showWelcomeBackDialog;
 
   const handleClearScreen = useCallback(() => {
     clearItems();
@@ -862,7 +979,10 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
       !isAuthDialogOpen &&
       !isThemeDialogOpen &&
       !isEditorDialogOpen &&
+      !isSubagentCreateDialogOpen &&
       !showPrivacyNotice &&
+      !showWelcomeBackDialog &&
+      welcomeBackChoice !== 'restart' &&
       geminiClient?.isInitialized?.()
     ) {
       submitQuery(initialPrompt);
@@ -875,7 +995,10 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
     isAuthDialogOpen,
     isThemeDialogOpen,
     isEditorDialogOpen,
+    isSubagentCreateDialogOpen,
     showPrivacyNotice,
+    showWelcomeBackDialog,
+    welcomeBackChoice,
     geminiClient,
   ]);
 
@@ -984,6 +1107,13 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
               ))}
             </Box>
           )}
+          {showWelcomeBackDialog && welcomeBackInfo?.hasHistory && (
+            <WelcomeBackDialog
+              welcomeBackInfo={welcomeBackInfo}
+              onSelect={handleWelcomeBackSelection}
+              onClose={handleWelcomeBackClose}
+            />
+          )}
 
           {shouldShowIdePrompt && currentIDE ? (
             <IdeIntegrationNudge
@@ -992,6 +1122,17 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
             />
           ) : isFolderTrustDialogOpen ? (
             <FolderTrustDialog onSelect={handleFolderTrustSelect} />
+          ) : quitConfirmationRequest ? (
+            <QuitConfirmationDialog
+              onSelect={(choice) => {
+                const result = handleQuitConfirmationSelect(choice);
+                if (result?.shouldQuit) {
+                  quitConfirmationRequest.onConfirm(true, result.action);
+                } else {
+                  quitConfirmationRequest.onConfirm(false);
+                }
+              }}
+            />
           ) : shellConfirmationRequest ? (
             <ShellConfirmationDialog request={shellConfirmationRequest} />
           ) : confirmationRequest ? (
@@ -999,6 +1140,7 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
               {confirmationRequest.prompt}
               <Box paddingY={1}>
                 <RadioButtonSelect
+                  isFocused={!!confirmationRequest}
                   items={[
                     { label: 'Yes', value: true },
                     { label: 'No', value: false },
@@ -1034,6 +1176,20 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
                 settings={settings}
                 onSelect={() => closeSettingsDialog()}
                 onRestartRequest={() => process.exit(0)}
+              />
+            </Box>
+          ) : isSubagentCreateDialogOpen ? (
+            <Box flexDirection="column">
+              <AgentCreationWizard
+                onClose={closeSubagentCreateDialog}
+                config={config}
+              />
+            </Box>
+          ) : isAgentsManagerDialogOpen ? (
+            <Box flexDirection="column">
+              <AgentsManagerDialog
+                onClose={closeAgentsManagerDialog}
+                config={config}
               />
             </Box>
           ) : isAuthenticating ? (
@@ -1125,6 +1281,39 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
                 elapsedTime={elapsedTime}
               />
 
+              {/* Display queued messages below loading indicator */}
+              {messageQueue.length > 0 && (
+                <Box flexDirection="column" marginTop={1}>
+                  {messageQueue
+                    .slice(0, MAX_DISPLAYED_QUEUED_MESSAGES)
+                    .map((message, index) => {
+                      // Ensure multi-line messages are collapsed for the preview.
+                      // Replace all whitespace (including newlines) with a single space.
+                      const preview = message.replace(/\s+/g, ' ');
+
+                      return (
+                        // Ensure the Box takes full width so truncation calculates correctly
+                        <Box key={index} paddingLeft={2} width="100%">
+                          {/* Use wrap="truncate" to ensure it fits the terminal width and doesn't wrap */}
+                          <Text dimColor wrap="truncate">
+                            {preview}
+                          </Text>
+                        </Box>
+                      );
+                    })}
+                  {messageQueue.length > MAX_DISPLAYED_QUEUED_MESSAGES && (
+                    <Box paddingLeft={2}>
+                      <Text dimColor>
+                        ... (+
+                        {messageQueue.length -
+                          MAX_DISPLAYED_QUEUED_MESSAGES}{' '}
+                        more)
+                      </Text>
+                    </Box>
+                  )}
+                </Box>
+              )}
+
               <Box
                 marginTop={1}
                 justifyContent="space-between"
@@ -1133,12 +1322,12 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
                 alignItems={isNarrow ? 'flex-start' : 'center'}
               >
                 <Box>
-                  {process.env.GEMINI_SYSTEM_MD && (
+                  {process.env['GEMINI_SYSTEM_MD'] && (
                     <Text color={Colors.AccentRed}>|⌐■_■| </Text>
                   )}
                   {ctrlCPressedOnce ? (
                     <Text color={Colors.AccentYellow}>
-                      Press Ctrl+C again to exit.
+                      Press Ctrl+C again to confirm exit.
                     </Text>
                   ) : ctrlDPressedOnce ? (
                     <Text color={Colors.AccentYellow}>
@@ -1237,22 +1426,27 @@ const App = ({ config, settings, startupWarnings = [], version }: AppProps) => {
               )}
             </Box>
           )}
-          <Footer
-            model={currentModel}
-            targetDir={config.getTargetDir()}
-            debugMode={config.getDebugMode()}
-            branchName={branchName}
-            debugMessage={debugMessage}
-            corgiMode={corgiMode}
-            errorCount={errorCount}
-            showErrorDetails={showErrorDetails}
-            showMemoryUsage={
-              config.getDebugMode() || settings.merged.showMemoryUsage || false
-            }
-            promptTokenCount={sessionStats.lastPromptTokenCount}
-            nightly={nightly}
-            vimMode={vimModeEnabled ? vimMode : undefined}
-          />
+          {!settings.merged.hideFooter && (
+            <Footer
+              model={currentModel}
+              targetDir={config.getTargetDir()}
+              debugMode={config.getDebugMode()}
+              branchName={branchName}
+              debugMessage={debugMessage}
+              corgiMode={corgiMode}
+              errorCount={errorCount}
+              showErrorDetails={showErrorDetails}
+              showMemoryUsage={
+                config.getDebugMode() ||
+                settings.merged.showMemoryUsage ||
+                false
+              }
+              promptTokenCount={sessionStats.lastPromptTokenCount}
+              nightly={nightly}
+              vimMode={vimModeEnabled ? vimMode : undefined}
+              isTrustedFolder={isTrustedFolderState}
+            />
+          )}
         </Box>
       </Box>
     </StreamingContext.Provider>

@@ -12,14 +12,14 @@ import { ReadFileTool } from '../tools/read-file.js';
 import { ReadManyFilesTool } from '../tools/read-many-files.js';
 import { GrepTool } from '../tools/grep.js';
 import { LruCache } from './LruCache.js';
-import { DEFAULT_GEMINI_FLASH_LITE_MODEL } from '../config/models.js';
+import { DEFAULT_QWEN_FLASH_MODEL } from '../config/models.js';
 import {
   isFunctionResponse,
   isFunctionCall,
 } from '../utils/messageInspectors.js';
 import * as fs from 'fs';
 
-const EditModel = DEFAULT_GEMINI_FLASH_LITE_MODEL;
+const EditModel = DEFAULT_QWEN_FLASH_MODEL;
 const EditConfig: GenerateContentConfig = {
   thinkingConfig: {
     thinkingBudget: 0,
@@ -119,7 +119,7 @@ async function findLastEditTimestamp(
         const { response } = part.functionResponse;
         if (response && !('error' in response) && 'output' in response) {
           id = part.functionResponse.id;
-          content = response.output;
+          content = response['output'];
         }
       }
 
@@ -411,10 +411,10 @@ Return ONLY the corrected target snippet in the specified JSON format with the k
 
     if (
       result &&
-      typeof result.corrected_target_snippet === 'string' &&
-      result.corrected_target_snippet.length > 0
+      typeof result['corrected_target_snippet'] === 'string' &&
+      result['corrected_target_snippet'].length > 0
     ) {
-      return result.corrected_target_snippet;
+      return result['corrected_target_snippet'];
     } else {
       return problematicSnippet;
     }
@@ -499,10 +499,10 @@ Return ONLY the corrected string in the specified JSON format with the key 'corr
 
     if (
       result &&
-      typeof result.corrected_new_string === 'string' &&
-      result.corrected_new_string.length > 0
+      typeof result['corrected_new_string'] === 'string' &&
+      result['corrected_new_string'].length > 0
     ) {
-      return result.corrected_new_string;
+      return result['corrected_new_string'];
     } else {
       return originalNewString;
     }
@@ -568,10 +568,10 @@ Return ONLY the corrected string in the specified JSON format with the key 'corr
 
     if (
       result &&
-      typeof result.corrected_new_string_escaping === 'string' &&
-      result.corrected_new_string_escaping.length > 0
+      typeof result['corrected_new_string_escaping'] === 'string' &&
+      result['corrected_new_string_escaping'].length > 0
     ) {
-      return result.corrected_new_string_escaping;
+      return result['corrected_new_string_escaping'];
     } else {
       return potentiallyProblematicNewString;
     }
@@ -634,10 +634,10 @@ Return ONLY the corrected string in the specified JSON format with the key 'corr
 
     if (
       result &&
-      typeof result.corrected_string_escaping === 'string' &&
-      result.corrected_string_escaping.length > 0
+      typeof result['corrected_string_escaping'] === 'string' &&
+      result['corrected_string_escaping'].length > 0
     ) {
-      return result.corrected_string_escaping;
+      return result['corrected_string_escaping'];
     } else {
       return potentiallyProblematicString;
     }

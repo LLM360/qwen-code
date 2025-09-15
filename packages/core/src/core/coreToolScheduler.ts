@@ -73,7 +73,7 @@ export type ExecutingToolCall = {
   request: ToolCallRequestInfo;
   tool: AnyDeclarativeTool;
   invocation: AnyToolInvocation;
-  liveOutput?: string;
+  liveOutput?: ToolResultDisplay;
   startTime?: number;
   outcome?: ToolConfirmationOutcome;
 };
@@ -120,7 +120,7 @@ export type ConfirmHandler = (
 
 export type OutputUpdateHandler = (
   toolCallId: string,
-  outputChunk: string,
+  outputChunk: ToolResultDisplay,
 ) => void;
 
 export type AllToolCallsCompleteHandler = (
@@ -171,10 +171,10 @@ export function convertToFunctionResponse(
 
   // After this point, contentToProcess is a single Part object.
   if (contentToProcess.functionResponse) {
-    if (contentToProcess.functionResponse.response?.content) {
+    if (contentToProcess.functionResponse.response?.['content']) {
       const stringifiedOutput =
         getResponseTextFromParts(
-          contentToProcess.functionResponse.response.content as Part[],
+          contentToProcess.functionResponse.response['content'] as Part[],
         ) || '';
       return createFunctionResponsePart(callId, toolName, stringifiedOutput);
     }
@@ -226,7 +226,7 @@ const createErrorResponse = (
 });
 
 interface CoreToolSchedulerOptions {
-  toolRegistry: Promise<ToolRegistry>;
+  toolRegistry: ToolRegistry;
   outputUpdateHandler?: OutputUpdateHandler;
   onAllToolCallsComplete?: AllToolCallsCompleteHandler;
   onToolCallsUpdate?: ToolCallsUpdateHandler;
@@ -236,7 +236,7 @@ interface CoreToolSchedulerOptions {
 }
 
 export class CoreToolScheduler {
-  private toolRegistry: Promise<ToolRegistry>;
+  private toolRegistry: ToolRegistry;
   private toolCalls: ToolCall[] = [];
   private outputUpdateHandler?: OutputUpdateHandler;
   private onAllToolCallsComplete?: AllToolCallsCompleteHandler;
@@ -373,6 +373,13 @@ export class CoreToolScheduler {
                   waitingCall.confirmationDetails.originalContent,
                 newContent: waitingCall.confirmationDetails.newContent,
               };
+            }
+          } else if (currentCall.status === 'executing') {
+            // If the tool was streaming live output, preserve the latest
+            // output so the UI can continue to show it after cancellation.
+            const executingCall = currentCall as ExecutingToolCall;
+            if (executingCall.liveOutput !== undefined) {
+              resultDisplay = executingCall.liveOutput;
             }
           }
 
@@ -534,11 +541,10 @@ export class CoreToolScheduler {
         );
       }
       const requestsToProcess = Array.isArray(request) ? request : [request];
-      const toolRegistry = await this.toolRegistry;
 
       const newToolCalls: ToolCall[] = requestsToProcess.map(
         (reqInfo): ToolCall => {
-          const toolInstance = toolRegistry.getTool(reqInfo.name);
+          const toolInstance = this.toolRegistry.getTool(reqInfo.name);
           if (!toolInstance) {
             return {
               status: 'error',
@@ -591,6 +597,14 @@ export class CoreToolScheduler {
         const { request: reqInfo, invocation } = toolCall;
 
         try {
+          if (signal.aborted) {
+            this.setStatusInternal(
+              reqInfo.callId,
+              'cancelled',
+              'Tool call cancelled by user.',
+            );
+            continue;
+          }
           if (this.config.getApprovalMode() === ApprovalMode.YOLO) {
             this.setToolCallOutcome(
               reqInfo.callId,
@@ -686,6 +700,10 @@ export class CoreToolScheduler {
 
     if (toolCall && toolCall.status === 'awaiting_approval') {
       await originalOnConfirm(outcome);
+    }
+
+    if (outcome === ToolConfirmationOutcome.ProceedAlways) {
+      await this.autoApproveCompatiblePendingTools(signal, callId);
     }
 
     this.setToolCallOutcome(callId, outcome);
@@ -805,20 +823,19 @@ export class CoreToolScheduler {
         const invocation = scheduledCall.invocation;
         this.setStatusInternal(callId, 'executing');
 
-        const liveOutputCallback =
-          scheduledCall.tool.canUpdateOutput && this.outputUpdateHandler
-            ? (outputChunk: string) => {
-                if (this.outputUpdateHandler) {
-                  this.outputUpdateHandler(callId, outputChunk);
-                }
-                this.toolCalls = this.toolCalls.map((tc) =>
-                  tc.request.callId === callId && tc.status === 'executing'
-                    ? { ...tc, liveOutput: outputChunk }
-                    : tc,
-                );
-                this.notifyToolCallsUpdate();
+        const liveOutputCallback = scheduledCall.tool.canUpdateOutput
+          ? (outputChunk: ToolResultDisplay) => {
+              if (this.outputUpdateHandler) {
+                this.outputUpdateHandler(callId, outputChunk);
               }
-            : undefined;
+              this.toolCalls = this.toolCalls.map((tc) =>
+                tc.request.callId === callId && tc.status === 'executing'
+                  ? { ...tc, liveOutput: outputChunk }
+                  : tc,
+              );
+              this.notifyToolCallsUpdate();
+            }
+          : undefined;
 
         invocation
           .execute(signal, liveOutputCallback)
@@ -920,5 +937,36 @@ export class CoreToolScheduler {
         outcome,
       };
     });
+  }
+
+  private async autoApproveCompatiblePendingTools(
+    signal: AbortSignal,
+    triggeringCallId: string,
+  ): Promise<void> {
+    const pendingTools = this.toolCalls.filter(
+      (call) =>
+        call.status === 'awaiting_approval' &&
+        call.request.callId !== triggeringCallId,
+    ) as WaitingToolCall[];
+
+    for (const pendingTool of pendingTools) {
+      try {
+        const stillNeedsConfirmation =
+          await pendingTool.invocation.shouldConfirmExecute(signal);
+
+        if (!stillNeedsConfirmation) {
+          this.setToolCallOutcome(
+            pendingTool.request.callId,
+            ToolConfirmationOutcome.ProceedAlways,
+          );
+          this.setStatusInternal(pendingTool.request.callId, 'scheduled');
+        }
+      } catch (error) {
+        console.error(
+          `Error checking confirmation for tool ${pendingTool.request.callId}:`,
+          error,
+        );
+      }
+    }
   }
 }

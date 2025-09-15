@@ -20,7 +20,6 @@ import * as Diff from 'diff';
 import { DEFAULT_DIFF_OPTIONS } from './diffOptions.js';
 import { tildeifyPath } from '../utils/paths.js';
 import { ModifiableDeclarativeTool, ModifyContext } from './modifiable-tool.js';
-import { SchemaValidator } from '../utils/schemaValidator.js';
 
 const memoryToolSchemaData: FunctionDeclaration = {
   name: 'save_memory',
@@ -389,22 +388,16 @@ export class MemoryTool
   constructor() {
     super(
       MemoryTool.Name,
-      'Save Memory',
+      'SaveMemory',
       memoryToolDescription,
       Kind.Think,
       memoryToolSchemaData.parametersJsonSchema as Record<string, unknown>,
     );
   }
 
-  override validateToolParams(params: SaveMemoryParams): string | null {
-    const errors = SchemaValidator.validate(
-      this.schema.parametersJsonSchema,
-      params,
-    );
-    if (errors) {
-      return errors;
-    }
-
+  protected override validateToolParamValues(
+    params: SaveMemoryParams,
+  ): string | null {
     if (params.fact.trim() === '') {
       return 'Parameter "fact" must be a non-empty string.';
     }

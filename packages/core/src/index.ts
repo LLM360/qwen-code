@@ -10,6 +10,7 @@ export * from './config/config.js';
 // Export Core Logic
 export * from './core/client.js';
 export * from './core/contentGenerator.js';
+export * from './core/loggingContentGenerator.js';
 export * from './core/geminiChat.js';
 export * from './core/logger.js';
 export * from './core/prompts.js';
@@ -43,10 +44,14 @@ export * from './utils/textUtils.js';
 export * from './utils/formatters.js';
 export * from './utils/filesearch/fileSearch.js';
 export * from './utils/errorParsing.js';
+export * from './utils/subagentGenerator.js';
+export * from './utils/projectSummary.js';
 
 // Export services
 export * from './services/fileDiscoveryService.js';
 export * from './services/gitService.js';
+export * from './services/chatRecordingService.js';
+export * from './services/fileSystemService.js';
 
 // Export IDE specific logic
 export * from './ide/ide-client.js';
@@ -54,6 +59,7 @@ export * from './ide/ideContext.js';
 export * from './ide/ide-installer.js';
 export * from './ide/constants.js';
 export { getIdeInfo, DetectedIde, IdeInfo } from './ide/detect-ide.js';
+export * from './ide/constants.js';
 
 // Export Shell Execution Service
 export * from './services/shellExecutionService.js';
@@ -62,6 +68,9 @@ export * from './services/shellExecutionService.js';
 export * from './tools/tools.js';
 export * from './tools/tool-error.js';
 export * from './tools/tool-registry.js';
+
+// Export subagents (Phase 1)
+export * from './subagents/index.js';
 
 // Export prompt logic
 export * from './prompts/mcp-prompts.js';

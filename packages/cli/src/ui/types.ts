@@ -46,7 +46,7 @@ export interface IndividualToolCallDisplay {
   callId: string;
   name: string;
   description: string;
-  resultDisplay: ToolResultDisplay | undefined;
+  resultDisplay: ToolResultDisplay | string | undefined;
   status: ToolCallStatus;
   confirmationDetails: ToolCallConfirmationDetails | undefined;
   renderOutputAsMarkdown?: boolean;
@@ -56,6 +56,12 @@ export interface CompressionProps {
   isPending: boolean;
   originalTokenCount: number | null;
   newTokenCount: number | null;
+}
+
+export interface SummaryProps {
+  isPending: boolean;
+  stage: 'generating' | 'saving' | 'completed';
+  filePath?: string; // Path to the saved summary file
 }
 
 export interface HistoryItemBase {
@@ -95,6 +101,7 @@ export type HistoryItemAbout = HistoryItemBase & {
   modelVersion: string;
   selectedAuthType: string;
   gcpProject: string;
+  ideClient: string;
 };
 
 export type HistoryItemHelp = HistoryItemBase & {
@@ -120,6 +127,11 @@ export type HistoryItemQuit = HistoryItemBase & {
   duration: string;
 };
 
+export type HistoryItemQuitConfirmation = HistoryItemBase & {
+  type: 'quit_confirmation';
+  duration: string;
+};
+
 export type HistoryItemToolGroup = HistoryItemBase & {
   type: 'tool_group';
   tools: IndividualToolCallDisplay[];
@@ -133,6 +145,11 @@ export type HistoryItemUserShell = HistoryItemBase & {
 export type HistoryItemCompression = HistoryItemBase & {
   type: 'compression';
   compression: CompressionProps;
+};
+
+export type HistoryItemSummary = HistoryItemBase & {
+  type: 'summary';
+  summary: SummaryProps;
 };
 
 // Using Omit<HistoryItem, 'id'> seems to have some issues with typescript's
@@ -153,7 +170,9 @@ export type HistoryItemWithoutId =
   | HistoryItemModelStats
   | HistoryItemToolStats
   | HistoryItemQuit
-  | HistoryItemCompression;
+  | HistoryItemQuitConfirmation
+  | HistoryItemCompression
+  | HistoryItemSummary;
 
 export type HistoryItem = HistoryItemWithoutId & { id: number };
 
@@ -168,8 +187,10 @@ export enum MessageType {
   MODEL_STATS = 'model_stats',
   TOOL_STATS = 'tool_stats',
   QUIT = 'quit',
+  QUIT_CONFIRMATION = 'quit_confirmation',
   GEMINI = 'gemini',
   COMPRESSION = 'compression',
+  SUMMARY = 'summary',
 }
 
 // Simplified message structure for internal feedback
@@ -188,6 +209,7 @@ export type Message =
       modelVersion: string;
       selectedAuthType: string;
       gcpProject: string;
+      ideClient: string;
       content?: string; // Optional content, not really used for ABOUT
     }
   | {
@@ -218,8 +240,19 @@ export type Message =
       content?: string;
     }
   | {
+      type: MessageType.QUIT_CONFIRMATION;
+      timestamp: Date;
+      duration: string;
+      content?: string;
+    }
+  | {
       type: MessageType.COMPRESSION;
       compression: CompressionProps;
+      timestamp: Date;
+    }
+  | {
+      type: MessageType.SUMMARY;
+      summary: SummaryProps;
       timestamp: Date;
     };
 

@@ -66,7 +66,6 @@ export interface CommandContext {
   // Session-specific data
   session: {
     stats: SessionStatsState;
-    resetSession: () => void;
     /** A transient list of shell commands the user has approved for this session. */
     sessionShellAllowlist: Set<string>;
   };
@@ -89,6 +88,12 @@ export interface QuitActionReturn {
   messages: HistoryItem[];
 }
 
+/** The return type for a command action that requests quit confirmation. */
+export interface QuitConfirmationActionReturn {
+  type: 'quit_confirmation';
+  messages: HistoryItem[];
+}
+
 /**
  * The return type for a command action that results in a simple message
  * being displayed to the user.
@@ -105,7 +110,15 @@ export interface MessageActionReturn {
 export interface OpenDialogActionReturn {
   type: 'dialog';
 
-  dialog: 'help' | 'auth' | 'theme' | 'editor' | 'privacy' | 'settings';
+  dialog:
+    | 'help'
+    | 'auth'
+    | 'theme'
+    | 'editor'
+    | 'privacy'
+    | 'settings'
+    | 'subagent_create'
+    | 'subagent_list';
 }
 
 /**
@@ -155,6 +168,7 @@ export type SlashCommandActionReturn =
   | ToolActionReturn
   | MessageActionReturn
   | QuitActionReturn
+  | QuitConfirmationActionReturn
   | OpenDialogActionReturn
   | LoadHistoryActionReturn
   | SubmitPromptActionReturn

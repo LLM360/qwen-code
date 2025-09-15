@@ -8,7 +8,8 @@ import { createHash } from 'crypto';
 import { GeminiEventType, ServerGeminiStreamEvent } from '../core/turn.js';
 import { logLoopDetected } from '../telemetry/loggers.js';
 import { LoopDetectedEvent, LoopType } from '../telemetry/types.js';
-import { Config, DEFAULT_GEMINI_FLASH_MODEL } from '../config/config.js';
+import { Config } from '../config/config.js';
+import { DEFAULT_QWEN_FLASH_MODEL } from '../config/models.js';
 
 const TOOL_CALL_LOOP_THRESHOLD = 5;
 const CONTENT_LOOP_THRESHOLD = 10;
@@ -360,17 +361,17 @@ Please analyze the conversation history to determine the possibility that the co
     try {
       result = await this.config
         .getGeminiClient()
-        .generateJson(contents, schema, signal, DEFAULT_GEMINI_FLASH_MODEL);
+        .generateJson(contents, schema, signal, DEFAULT_QWEN_FLASH_MODEL);
     } catch (e) {
       // Do nothing, treat it as a non-loop.
       this.config.getDebugMode() ? console.error(e) : console.debug(e);
       return false;
     }
 
-    if (typeof result.confidence === 'number') {
-      if (result.confidence > 0.9) {
-        if (typeof result.reasoning === 'string' && result.reasoning) {
-          console.warn(result.reasoning);
+    if (typeof result['confidence'] === 'number') {
+      if (result['confidence'] > 0.9) {
+        if (typeof result['reasoning'] === 'string' && result['reasoning']) {
+          console.warn(result['reasoning']);
         }
         logLoopDetected(
           this.config,
@@ -381,7 +382,7 @@ Please analyze the conversation history to determine the possibility that the co
         this.llmCheckInterval = Math.round(
           MIN_LLM_CHECK_INTERVAL +
             (MAX_LLM_CHECK_INTERVAL - MIN_LLM_CHECK_INTERVAL) *
-              (1 - result.confidence),
+              (1 - result['confidence']),
         );
       }
     }

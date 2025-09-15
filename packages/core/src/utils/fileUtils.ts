@@ -8,9 +8,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { PartUnion } from '@google/genai';
 import mime from 'mime-types';
+import { FileSystemService } from '../services/fileSystemService.js';
 
 // Constants for text file processing
-const DEFAULT_MAX_LINES_TEXT_FILE = 2000;
+export const DEFAULT_MAX_LINES_TEXT_FILE = 2000;
 const MAX_LINE_LENGTH_TEXT_FILE = 2000;
 
 // Default values for encoding and separator format
@@ -223,6 +224,7 @@ export interface ProcessedFileReadResult {
 export async function processSingleFileContent(
   filePath: string,
   rootDirectory: string,
+  fileSystemService: FileSystemService,
   offset?: number,
   limit?: number,
 ): Promise<ProcessedFileReadResult> {
@@ -279,14 +281,14 @@ export async function processSingleFileContent(
             returnDisplay: `Skipped large SVG file (>1MB): ${relativePathForDisplay}`,
           };
         }
-        const content = await fs.promises.readFile(filePath, 'utf8');
+        const content = await fileSystemService.readTextFile(filePath);
         return {
           llmContent: content,
           returnDisplay: `Read SVG as text: ${relativePathForDisplay}`,
         };
       }
       case 'text': {
-        const content = await fs.promises.readFile(filePath, 'utf8');
+        const content = await fileSystemService.readTextFile(filePath);
         const lines = content.split('\n');
         const originalLineCount = lines.length;
 

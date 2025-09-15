@@ -90,6 +90,11 @@ interface OpenAIResponseFormat {
   usage?: OpenAIUsage;
 }
 
+/**
+ * @deprecated refactored to ./openaiContentGenerator
+ * use `createOpenAIContentGenerator` instead
+ * or extend `OpenAIContentGenerator` to add customized behavior
+ */
 export class OpenAIContentGenerator implements ContentGenerator {
   protected client: OpenAI;
   private model: string;
@@ -213,6 +218,17 @@ export class OpenAIContentGenerator implements ContentGenerator {
   }
 
   /**
+   * Check if cache control should be disabled based on configuration.
+   *
+   * @returns true if cache control should be disabled, false otherwise
+   */
+  private shouldDisableCacheControl(): boolean {
+    return (
+      this.config.getContentGeneratorConfig()?.disableCacheControl === true
+    );
+  }
+
+  /**
    * Build metadata object for OpenAI API requests.
    *
    * @param userPromptId The user prompt ID to include in metadata
@@ -242,7 +258,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
     // Add cache control to system and last messages for DashScope providers
     // Only add cache control to system message for non-streaming requests
-    if (this.isDashScopeProvider()) {
+    if (this.isDashScopeProvider() && !this.shouldDisableCacheControl()) {
       messages = this.addDashScopeCacheControl(
         messages,
         streaming ? 'both' : 'system',
@@ -538,7 +554,18 @@ export class OpenAIContentGenerator implements ContentGenerator {
     this.streamingToolCalls.clear();
 
     for await (const chunk of stream) {
-      yield this.convertStreamChunkToGeminiFormat(chunk);
+      const response = this.convertStreamChunkToGeminiFormat(chunk);
+
+      // Ignore empty responses, which would cause problems with downstream code
+      // that expects a valid response.
+      if (
+        response.candidates?.[0]?.content?.parts?.length === 0 &&
+        !response.usageMetadata
+      ) {
+        continue;
+      }
+
+      yield response;
     }
   }
 
@@ -924,7 +951,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
 
             messages.push({
               role: 'assistant' as const,
-              content: textParts.join('\n') || null,
+              content: textParts.join('') || null,
               tool_calls: toolCalls,
             });
           }
@@ -934,7 +961,7 @@ export class OpenAIContentGenerator implements ContentGenerator {
               content.role === 'model'
                 ? ('assistant' as const)
                 : ('user' as const);
-            const text = textParts.join('\n');
+            const text = textParts.join('');
             if (text) {
               messages.push({ role, content: text });
             }
